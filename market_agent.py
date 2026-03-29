@@ -10,143 +10,47 @@ Public API:
 
 from __future__ import annotations
 
+import json
 import os
+import time
 from datetime import datetime, timedelta
 
 import pytz
+import requests
 
 EST = pytz.timezone("America/New_York")
 
 # ---------------------------------------------------------------------------
-# Mock Prediction Market Contracts — Organized by Topic AND Sector
+# Polymarket API — Live Contract Search
 # ---------------------------------------------------------------------------
 
-MOCK_CONTRACTS: dict[str, list[dict]] = {
-    "Tariffs": [
-        {
-            "contract": "Will Trump announce new tariffs on China by end of Q2?",
-            "yes_price": 0.72, "no_price": 0.28, "volume": 287_000,
-            "market": "Polymarket", "sector": "US Equities",
-        },
-        {
-            "contract": "US average tariff rate above 20% on July 1?",
-            "yes_price": 0.58, "no_price": 0.42, "volume": 145_000,
-            "market": "Kalshi", "sector": "US Equities",
-        },
-        {
-            "contract": "Will EU retaliate with counter-tariffs before August?",
-            "yes_price": 0.64, "no_price": 0.36, "volume": 93_500,
-            "market": "Polymarket", "sector": "Forex",
-        },
-        {
-            "contract": "FXI (China ETF) drops 5%+ within 48h of tariff tweet?",
-            "yes_price": 0.41, "no_price": 0.59, "volume": 178_000,
-            "market": "Kalshi", "sector": "China/EM",
-        },
-        {
-            "contract": "Gold above $3,200 within 1 week of tariff announcement?",
-            "yes_price": 0.55, "no_price": 0.45, "volume": 210_000,
-            "market": "Polymarket", "sector": "Commodities",
-        },
-    ],
-    "Crypto": [
-        {
-            "contract": "Will Trump mention Bitcoin in an official statement this month?",
-            "yes_price": 0.45, "no_price": 0.55, "volume": 312_000,
-            "market": "Polymarket", "sector": "Crypto",
-        },
-        {
-            "contract": "Bitcoin above $120k on June 30?",
-            "yes_price": 0.38, "no_price": 0.62, "volume": 520_000,
-            "market": "Kalshi", "sector": "Crypto",
-        },
-        {
-            "contract": "Executive order on crypto regulation before Q3?",
-            "yes_price": 0.51, "no_price": 0.49, "volume": 178_000,
-            "market": "Polymarket", "sector": "Crypto",
-        },
-        {
-            "contract": "SOL/USD above $300 by end of month after Trump crypto tweet?",
-            "yes_price": 0.29, "no_price": 0.71, "volume": 95_000,
-            "market": "Kalshi", "sector": "Crypto",
-        },
-    ],
-    "Media": [
-        {
-            "contract": "Will Trump revoke a major outlet's press credentials?",
-            "yes_price": 0.33, "no_price": 0.67, "volume": 98_000,
-            "market": "Polymarket", "sector": "US Equities",
-        },
-        {
-            "contract": "Trump lawsuit against a media company filed this quarter?",
-            "yes_price": 0.41, "no_price": 0.59, "volume": 67_000,
-            "market": "Kalshi", "sector": "US Equities",
-        },
-    ],
-    "Borders": [
-        {
-            "contract": "Southern border crossings below 100k/month by June?",
-            "yes_price": 0.55, "no_price": 0.45, "volume": 203_000,
-            "market": "Polymarket", "sector": "US Equities",
-        },
-        {
-            "contract": "New executive order on immigration before May?",
-            "yes_price": 0.78, "no_price": 0.22, "volume": 156_000,
-            "market": "Kalshi", "sector": "US Equities",
-        },
-        {
-            "contract": "USD/MXN above 18.5 within 1 week of border tweet?",
-            "yes_price": 0.62, "no_price": 0.38, "volume": 134_000,
-            "market": "Polymarket", "sector": "Forex",
-        },
-    ],
-    "Fed": [
-        {
-            "contract": "Fed rate cut before July FOMC meeting?",
-            "yes_price": 0.61, "no_price": 0.39, "volume": 890_000,
-            "market": "Kalshi", "sector": "Bonds",
-        },
-        {
-            "contract": "Trump publicly calls for Powell's removal this quarter?",
-            "yes_price": 0.48, "no_price": 0.52, "volume": 245_000,
-            "market": "Polymarket", "sector": "US Equities",
-        },
-        {
-            "contract": "TLT (bond ETF) up 3%+ within 48h of dovish Trump tweet?",
-            "yes_price": 0.44, "no_price": 0.56, "volume": 315_000,
-            "market": "Kalshi", "sector": "Bonds",
-        },
-        {
-            "contract": "DXY below 102 within 1 week of Fed pressure tweet?",
-            "yes_price": 0.37, "no_price": 0.63, "volume": 188_000,
-            "market": "Polymarket", "sector": "Forex",
-        },
-    ],
-    "Cabinet": [
-        {
-            "contract": "Cabinet reshuffle (any secretary replaced) by June?",
-            "yes_price": 0.35, "no_price": 0.65, "volume": 112_000,
-            "market": "Polymarket", "sector": "US Equities",
-        },
-        {
-            "contract": "New cabinet nominee confirmation hearing before May?",
-            "yes_price": 0.52, "no_price": 0.48, "volume": 89_000,
-            "market": "Kalshi", "sector": "US Equities",
-        },
-    ],
-    "Other": [
-        {
-            "contract": "Trump Truth Social post volume above 500 this month?",
-            "yes_price": 0.70, "no_price": 0.30, "volume": 54_000,
-            "market": "Polymarket", "sector": "US Equities",
-        },
-        {
-            "contract": "Trump approval rating above 50% on May 1 (538 avg)?",
-            "yes_price": 0.44, "no_price": 0.56, "volume": 410_000,
-            "market": "Kalshi", "sector": "US Equities",
-        },
-    ],
+GAMMA_API = "https://gamma-api.polymarket.com"
+
+# Topic → search queries for Polymarket
+TOPIC_SEARCH_QUERIES: dict[str, list[str]] = {
+    "Tariffs": ["tariffs", "trump tariffs", "trade war"],
+    "Crypto":  ["crypto", "bitcoin", "trump crypto"],
+    "Media":   ["trump media", "free press", "censorship"],
+    "Borders": ["immigration", "border", "deportation"],
+    "Fed":     ["federal reserve", "interest rates", "fed rate"],
+    "Cabinet": ["trump cabinet", "trump administration"],
+    "Other":   ["trump", "politics"],
 }
+
+# Keywords that a contract must match (at least one) to be considered relevant
+TOPIC_RELEVANCE_KEYWORDS: dict[str, list[str]] = {
+    "Tariffs": ["tariff", "trade", "import", "export", "duty", "duties", "customs", "wto"],
+    "Crypto":  ["crypto", "bitcoin", "btc", "eth", "blockchain", "token", "coin", "digital currency"],
+    "Media":   ["media", "press", "news", "cnn", "nbc", "journalist", "censor", "free speech"],
+    "Borders": ["border", "immigra", "deport", "migrant", "asylum", "ice ", "wall"],
+    "Fed":     ["fed", "rate", "powell", "inflation", "interest", "monetary", "central bank"],
+    "Cabinet": ["cabinet", "secretary", "nominate", "appoint", "confirm", "resign", "administration"],
+    "Other":   ["trump", "president", "white house", "executive order", "congress", "senate"],
+}
+
+# Simple TTL cache for API responses
+_contract_cache: dict[str, tuple[float, list[dict]]] = {}
+_CACHE_TTL = 120  # seconds
 
 
 def search_market_contracts(
@@ -155,89 +59,110 @@ def search_market_contracts(
     probability: float = 0.5,
 ) -> list[dict]:
     """
-    Search for contracts matching topic + optional sector filter.
-    Dynamically adjusts prices based on prediction probability.
+    Search Polymarket's Gamma API for live contracts related to the topic.
+    Results are cached for 120s to avoid hammering the API on every slider move.
     """
-    contracts = MOCK_CONTRACTS.get(topic_keyword, MOCK_CONTRACTS["Other"])
+    cache_key = f"{topic_keyword}:{sector_filter or 'all'}"
+    now = time.time()
 
-    # Filter by sector
-    if sector_filter and sector_filter != "All":
-        contracts = [c for c in contracts if c.get("sector") == sector_filter]
-        # If no contracts match the sector, show all for the topic
-        if not contracts:
-            contracts = MOCK_CONTRACTS.get(topic_keyword, MOCK_CONTRACTS["Other"])
+    if cache_key in _contract_cache:
+        cached_time, cached_data = _contract_cache[cache_key]
+        if now - cached_time < _CACHE_TTL:
+            return cached_data
 
-    # Dynamically adjust prices based on probability
-    adjusted = []
-    for c in contracts:
-        ac = c.copy()
-        # Higher prediction probability -> shift YES prices up slightly
-        prob_shift = (probability - 0.5) * 0.08  # +/-4% shift
-        ac["yes_price"] = round(min(0.95, max(0.05, c["yes_price"] + prob_shift)), 2)
-        ac["no_price"] = round(1.0 - ac["yes_price"], 2)
-        # Volume increases with higher probability (more interest)
-        vol_mult = 0.8 + probability * 0.4  # 0.8x - 1.2x
-        ac["volume"] = int(c["volume"] * vol_mult)
-        adjusted.append(ac)
+    queries = TOPIC_SEARCH_QUERIES.get(topic_keyword, ["trump"])
+    contracts: list[dict] = []
+    seen_ids: set[str] = set()
 
-    return adjusted
+    for query in queries:
+        if len(contracts) >= 6:
+            break
+        try:
+            resp = requests.get(
+                f"{GAMMA_API}/public-search",
+                params={"q": query, "limit_per_type": 12},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            events = resp.json().get("events", [])
+
+            for event in events:
+                # Skip closed events
+                if event.get("closed"):
+                    continue
+
+                for market in event.get("markets", []):
+                    market_id = market.get("id", "")
+                    if market_id in seen_ids:
+                        continue
+                    seen_ids.add(market_id)
+
+                    # Skip closed/resolved markets
+                    if market.get("closed"):
+                        continue
+
+                    outcomes = json.loads(market.get("outcomes", "[]"))
+                    prices = json.loads(market.get("outcomePrices", "[]"))
+
+                    if len(outcomes) < 2 or len(prices) < 2:
+                        continue
+
+                    yes_price = float(prices[0])
+                    no_price = float(prices[1])
+
+                    # Skip effectively resolved markets (>95% or <5%)
+                    if yes_price < 0.05 or yes_price > 0.95:
+                        continue
+
+                    # Relevance filter: contract question must contain topic keywords
+                    question = market.get("question", event.get("title", "")).lower()
+                    relevance_words = TOPIC_RELEVANCE_KEYWORDS.get(topic_keyword, TOPIC_RELEVANCE_KEYWORDS["Other"])
+                    if not any(kw in question for kw in relevance_words):
+                        continue
+
+                    contracts.append({
+                        "contract": market.get("question", event.get("title", "Unknown")),
+                        "yes_price": round(yes_price, 3),
+                        "no_price": round(no_price, 3),
+                        "volume": int(float(event.get("volume", 0))),
+                        "market": "Polymarket",
+                    })
+
+                    if len(contracts) >= 6:
+                        break
+                if len(contracts) >= 6:
+                    break
+        except Exception:
+            continue
+
+    # Sort by volume descending — show the most liquid contracts first
+    contracts.sort(key=lambda c: c["volume"], reverse=True)
+
+    _contract_cache[cache_key] = (now, contracts)
+    return contracts
 
 
 # ---------------------------------------------------------------------------
-# Arbitrage Evaluation — Polymarket Alpha Delta
+# Signal Evaluation
 # ---------------------------------------------------------------------------
 
-ALPHA_DELTA_THRESHOLD = 0.10  # Minimum +10% edge to trigger HOT
+HOT_THRESHOLD = 0.50   # P(post) >= 50% → HOT, show contracts
 
 
-def evaluate_arbitrage(
+def evaluate_signal(
     ml_probability: float,
     contracts: list[dict],
 ) -> dict:
     """
-    Compare ML model's internal probability against the theoretical
-    Polymarket baseline (contract yes_price) to compute Alpha Delta.
-
-    Alpha Delta = ML_probability - Polymarket_baseline
-    A positive delta means our model sees an edge the crowd is missing.
-
-    Returns:
-        {
-            "polymarket_baseline": float,   # avg crowd probability
-            "ml_probability": float,        # our model's probability
-            "alpha_delta": float,           # our edge
-            "has_alpha": bool,              # alpha_delta >= threshold
-            "contracts_with_alpha": list,   # contracts where we have edge
-        }
+    Simple signal evaluation: P(post) is the signal strength.
+    If high enough, surface relevant Polymarket contracts.
     """
-    if not contracts:
-        return {
-            "polymarket_baseline": 0.50,
-            "ml_probability": ml_probability,
-            "alpha_delta": ml_probability - 0.50,
-            "has_alpha": (ml_probability - 0.50) >= ALPHA_DELTA_THRESHOLD,
-            "contracts_with_alpha": [],
-        }
-
-    # Compute average Polymarket baseline from contract prices
-    polymarket_baseline = sum(c["yes_price"] for c in contracts) / len(contracts)
-
-    alpha_delta = ml_probability - polymarket_baseline
-
-    # Tag individual contracts with their specific alpha
-    contracts_with_alpha = []
-    for c in contracts:
-        ca = c.copy()
-        ca["contract_alpha"] = round(ml_probability - c["yes_price"], 4)
-        ca["has_edge"] = ca["contract_alpha"] >= ALPHA_DELTA_THRESHOLD
-        contracts_with_alpha.append(ca)
+    is_hot = ml_probability >= HOT_THRESHOLD and len(contracts) > 0
 
     return {
-        "polymarket_baseline": round(polymarket_baseline, 4),
         "ml_probability": round(ml_probability, 4),
-        "alpha_delta": round(alpha_delta, 4),
-        "has_alpha": alpha_delta >= ALPHA_DELTA_THRESHOLD,
-        "contracts_with_alpha": contracts_with_alpha,
+        "has_alpha": is_hot,
+        "contracts_with_alpha": contracts if is_hot else [],
     }
 
 
@@ -268,7 +193,7 @@ def run_agent_cycle(
       3. Search for actionable prediction market contracts
       4. Evaluate arbitrage (Alpha Delta) against Polymarket
       5. Get market impact analysis
-      6. Signal is HOT only if alpha_delta >= +10%
+      6. Signal is HOT only if alpha_delta >= +3%
 
     Returns dict with all results including arbitrage evaluation.
     """
@@ -294,37 +219,35 @@ def run_agent_cycle(
     predicted_topic = None
     contracts = []
     market_impacts = []
-    arbitrage = {
-        "polymarket_baseline": 0.50,
+    signal_eval = {
         "ml_probability": probability,
-        "alpha_delta": probability - 0.50,
         "has_alpha": False,
         "contracts_with_alpha": [],
     }
 
     if probability >= PROBABILITY_THRESHOLD:
-        if use_llm and os.getenv("OPENAI_API_KEY") and recent_tweets:
+        if use_llm and recent_tweets:
             predicted_topic = predict_next_topic(recent_tweets)
         elif recent_tweets:
             predicted_topic = _keyword_topic_fallback(recent_tweets)
         else:
             predicted_topic = "Other"
 
-        # Step 3: find contracts
+        # Step 3: find live Polymarket contracts for this topic
         contracts = search_market_contracts(predicted_topic, sector_filter, probability)
 
-        # Step 4: Arbitrage evaluation — compare our edge vs Polymarket crowd
-        arbitrage = evaluate_arbitrage(probability, contracts)
+        # Step 4: Signal evaluation — P(post) >= 50% + contracts found = HOT
+        signal_eval = evaluate_signal(probability, contracts)
 
-        # Step 5: Signal is HOT only if we have alpha (>=10% edge over crowd)
-        if arbitrage["has_alpha"]:
+        if signal_eval["has_alpha"]:
             signal = "HOT"
-            # Use contracts with alpha for execution
-            contracts = arbitrage["contracts_with_alpha"]
+            contracts = signal_eval["contracts_with_alpha"]
+        elif probability >= HOT_THRESHOLD:
+            signal = "HOT"  # high probability but no contracts found
         else:
-            signal = "WARM"  # Above base threshold but no arbitrage edge
+            signal = "WARM"  # above base threshold but below HOT
 
-        # Step 6: market impact
+        # Step 5: market impact
         market_impacts = simulate_market_reaction(
             predicted_topic, probability, sector_filter,
             seed=int(current_time_hour * 100 + post_count_24h)
@@ -342,8 +265,7 @@ def run_agent_cycle(
         "sim_hour": current_time_hour,
         "hours_since_last": hours_since_last,
         "post_count_24h": post_count_24h,
-        # New quantitative fields
-        "arbitrage": arbitrage,
+        "arbitrage": signal_eval,
         "regime": regime_label,
         "news_volume_4h": news_volume_4h,
         "news_sentiment": news_sentiment,
@@ -352,7 +274,7 @@ def run_agent_cycle(
 
 
 def _keyword_topic_fallback(tweets: list[str]) -> str:
-    """Simple keyword matching when OpenAI is unavailable."""
+    """Simple keyword matching when Gemini is unavailable."""
     text = " ".join(tweets).lower()
     scores = {
         "Tariffs": sum(w in text for w in ["tariff", "trade", "china", "import", "export", "duty", "duties"]),

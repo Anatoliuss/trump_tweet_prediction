@@ -214,10 +214,19 @@ st.markdown("""
         font-family: 'Fira Code', 'Consolas', monospace !important;
     }
 
-    /* ── sidebar ── */
+    /* ── sidebar — always visible, no collapse ── */
     section[data-testid="stSidebar"] {
         background-color: #0d0f14;
         border-right: 1px solid #232730;
+        min-width: 310px !important;
+        max-width: 310px !important;
+        width: 310px !important;
+        transform: none !important;
+    }
+    [data-testid="stSidebarCollapseButton"],
+    [data-testid="stSidebarCollapsedControl"],
+    [data-testid="collapsedControl"] {
+        display: none !important;
     }
     section[data-testid="stSidebar"] .stSlider > div > div {
         color: #7b8498;
@@ -728,7 +737,7 @@ recent_tweets = [t.strip() for t in tweets_text.strip().split("\n") if t.strip()
 
 use_llm = st.sidebar.checkbox(
     "USE LLM TOPIC CLASSIFIER", value=False,
-    help="Requires OPENAI_API_KEY env var"
+    help="Uses Gemini for topic classification"
 )
 
 # ---------------------------------------------------------------------------
@@ -850,41 +859,44 @@ with tab1:
         )
 
     with col_right:
-        # Alpha Delta display
-        alpha_delta = arbitrage.get("alpha_delta", 0.0)
-        poly_baseline = arbitrage.get("polymarket_baseline", 0.5)
-        has_alpha = arbitrage.get("has_alpha", False)
+        # Signal status
+        has_edge = arbitrage.get("has_alpha", False)
 
-        if alpha_delta >= 0.10:
-            alpha_class = "alpha-positive"
-        elif alpha_delta > 0:
-            alpha_class = "alpha-neutral"
+        # Signal strength = P(post) itself
+        if prob >= 0.50:
+            strength_class = "alpha-positive"
+            strength_label = "STRONG"
+        elif prob >= 0.35:
+            strength_class = "alpha-neutral"
+            strength_label = "MODERATE"
         else:
-            alpha_class = "alpha-negative"
+            strength_class = "alpha-negative"
+            strength_label = "WEAK"
 
         st.markdown(
             f"<div class='alpha-container'>"
-            f"<div class='alpha-value {alpha_class}'>{alpha_delta:+.1%}</div>"
-            f"<div class='alpha-label'>Alpha Delta</div>"
+            f"<div class='alpha-value {strength_class}'>{prob:.0%}</div>"
+            f"<div class='alpha-label'>Signal Strength</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
 
-        # Polymarket baseline
+        # Contracts found
+        n_contracts = len(contracts)
         st.markdown(
             f"<div class='data-card'>"
-            f"<div class='data-card-value'><span class='mono'>{poly_baseline:.0%}</span></div>"
-            f"<div class='data-card-label'>Polymarket Baseline</div></div>",
+            f"<div class='data-card-value'><span class='mono'>{n_contracts}</span></div>"
+            f"<div class='data-card-label'>Live Contracts</div></div>",
             unsafe_allow_html=True,
         )
 
-        # Alpha status
-        alpha_status_color = "#5cd8a0" if has_alpha else "#596175"
-        alpha_status_text = "EDGE DETECTED" if has_alpha else "NO EDGE"
+        # Trade signal status
+        edge_color = "#5cd8a0" if has_edge else "#596175"
+        edge_text = "TRADE SIGNAL" if has_edge else "MONITORING"
         st.markdown(
             f"<div style='text-align:center; padding:0.5rem 0; margin-top:0.5rem;'>"
-            f"<span class='mono' style='color:{alpha_status_color}; font-size:0.7rem; "
-            f"font-weight:600; letter-spacing:0.1em;'>{alpha_status_text}</span>"
+            f"<span class='mono' style='color:{edge_color}; font-size:0.7rem; "
+            f"font-weight:600; letter-spacing:0.1em;'>{edge_text}</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -989,12 +1001,12 @@ with tab1:
         st.markdown('<div class="section-header">Execution Engine</div>', unsafe_allow_html=True)
 
         if signal == "HOT" and contracts:
-            # Show Alpha Delta banner at top of execution panel
+            # Pre-tweet edge banner
             st.markdown(
                 f"<div style='background: rgba(92,216,160,0.08); border: 1px solid rgba(92,216,160,0.25); "
-                f"border-radius: 3px; padding: 0.6rem 1rem; margin-bottom: 0.8rem; text-align: center;'>"
+                f"border-radius: 6px; padding: 0.6rem 1rem; margin-bottom: 0.8rem; text-align: center;'>"
                 f"<span class='mono' style='color: #5cd8a0; font-size: 0.75rem; font-weight: 600; "
-                f"letter-spacing: 0.1em;'>ALPHA DETECTED: {alpha_delta:+.1%} EDGE VS POLYMARKET</span>"
+                f"letter-spacing: 0.1em;'>TWEET ANTICIPATED &mdash; {prob:.0%} CONFIDENCE</span>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
@@ -1002,24 +1014,15 @@ with tab1:
             st.markdown(
                 f"<p style='font-family: Fira Code, monospace; font-size: 0.7rem; "
                 f"color: #5cd8a0; letter-spacing: 0.1em; text-transform: uppercase;'>"
-                f"ACTIVE &mdash; {len(contracts)} contracts matched for {topic}</p>",
+                f"LIVE &mdash; {len(contracts)} Polymarket contracts for &ldquo;{topic}&rdquo;</p>",
                 unsafe_allow_html=True,
             )
-            for c in contracts:
-                sector_tag = f"<span class='order-sector'>{c.get('sector', '')}</span>" if c.get('sector') else ""
-
-                # Alpha tag per contract
-                contract_alpha = c.get("contract_alpha", 0)
-                if contract_alpha >= 0.10:
-                    alpha_tag = f"<span class='order-alpha order-alpha-pos'>ALPHA {contract_alpha:+.0%}</span>"
-                elif contract_alpha > 0:
-                    alpha_tag = f"<span class='order-alpha order-alpha-neg'>+{contract_alpha:.0%}</span>"
-                else:
-                    alpha_tag = f"<span class='order-alpha order-alpha-neg'>{contract_alpha:+.0%}</span>"
+            for i, c in enumerate(contracts):
+                impact_tag = ""
 
                 st.markdown(
                     f"<div class='order-ticket'>"
-                    f"<div class='order-contract'>{c['contract']}{sector_tag}{alpha_tag}</div>"
+                    f"<div class='order-contract'>{c['contract']}{impact_tag}</div>"
                     f"<div class='order-prices'>"
                     f"<span class='order-yes'>YES <span class='mono'>{c['yes_price']:.0%}</span></span>"
                     f"<span class='order-no'>NO <span class='mono'>{c['no_price']:.0%}</span></span>"
@@ -1029,7 +1032,7 @@ with tab1:
                     unsafe_allow_html=True,
                 )
                 btn_left, btn_right, _ = st.columns([1, 1, 2])
-                contract_id = c["contract"][:30].replace(" ", "_")
+                contract_id = f"{i}_{c['contract'][:30].replace(' ', '_')}"
                 with btn_left:
                     if st.button(
                         f"BUY YES @ {c['yes_price']:.0%}",
@@ -1047,12 +1050,11 @@ with tab1:
         elif signal == "WARM":
             st.markdown(
                 f"<div style='background: rgba(237,192,74,0.08); border: 1px solid rgba(237,192,74,0.25); "
-                f"border-radius: 3px; padding: 0.8rem 1rem; text-align: center;'>"
+                f"border-radius: 6px; padding: 0.8rem 1rem; text-align: center;'>"
                 f"<span class='mono' style='color: #edc04a; font-size: 0.75rem; font-weight: 600; "
-                f"letter-spacing: 0.1em;'>SIGNAL WARM &mdash; NO ARBITRAGE EDGE</span><br>"
+                f"letter-spacing: 0.1em;'>WARM &mdash; BELOW 50% THRESHOLD</span><br>"
                 f"<span class='mono' style='color: #596175; font-size: 0.65rem;'>"
-                f"ML: {prob:.0%} vs Polymarket: {poly_baseline:.0%} &mdash; "
-                f"Alpha: {alpha_delta:+.1%} (need +10%)</span>"
+                f"P(post): {prob:.0%} &mdash; need 50% for trade signal</span>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
@@ -1060,14 +1062,14 @@ with tab1:
             st.markdown(
                 "<div class='standby-box'>"
                 "<div class='standby-label' style='color:#edc04a;'>Monitoring</div>"
-                "<div class='standby-detail'>Probability above base threshold but insufficient alpha.</div>"
-                "<div class='standby-detail' style='margin-top:0.3rem;'>Awaiting +10% edge over crowd consensus.</div>"
+                "<div class='standby-detail'>Tweet likely but expected market impact below threshold.</div>"
+                "<div class='standby-detail' style='margin-top:0.3rem;'>Watching for higher-impact topics.</div>"
                 "</div>",
                 unsafe_allow_html=True,
             )
 
         elif signal == "HOT":
-            st.warning("Signal active. No contracts matched the current sector filter.")
+            st.warning("Signal active but no contracts found on Polymarket for this topic.")
         else:
             st.markdown(
                 "<div class='standby-box'>"

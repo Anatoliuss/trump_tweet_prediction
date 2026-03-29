@@ -493,20 +493,21 @@ def predict_live_probability(
 
 def predict_next_topic(last_5_tweets_list: list[str]) -> str:
     """
-    Use GPT-4o-mini to classify what topic Trump will post about next.
+    Use Gemini to classify what topic Trump will post about next.
     """
     try:
-        from openai import OpenAI
+        import google.generativeai as genai
     except ImportError:
-        raise ImportError("Run: pip install openai")
+        raise ImportError("Run: pip install google-generativeai")
 
-    client = OpenAI()
+    genai.configure(api_key="AIzaSyCLExluAagAMELIHiJejWQT_GaBbC8rerc")
+    model = genai.GenerativeModel("gemini-2.5-flash")
 
     numbered_tweets = "\n".join(
         f"{i+1}. {t}" for i, t in enumerate(last_5_tweets_list[-5:])
     )
 
-    system_prompt = (
+    prompt = (
         "You are a political analyst specializing in Donald Trump's Truth Social posts. "
         "Your only job is to analyze recent posts and predict the single most likely topic "
         "of his NEXT post.\n\n"
@@ -515,26 +516,21 @@ def predict_next_topic(last_5_tweets_list: list[str]) -> str:
         "Rules:\n"
         "- Output ONLY the single keyword.\n"
         "- Do NOT add any other text, punctuation, or newlines.\n"
-        "- If context is ambiguous, choose the closest match or 'Other'."
-    )
-
-    user_prompt = (
+        "- If context is ambiguous, choose the closest match or 'Other'.\n\n"
         f"Here are Trump's {len(last_5_tweets_list[-5:])} most recent Truth Social posts "
         f"(oldest to newest):\n\n{numbered_tweets}\n\n"
         "Based on these posts, what is the single most likely topic of his next post?"
     )
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.0,
-        max_tokens=10,
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.0,
+            max_output_tokens=10,
+        ),
     )
 
-    raw = response.choices[0].message.content.strip()
+    raw = response.text.strip()
 
     for label in TOPIC_LABELS:
         if label.lower() == raw.lower():
