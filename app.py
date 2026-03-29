@@ -23,6 +23,21 @@ import json
 from pathlib import Path
 
 from market_agent import run_agent_cycle
+from ml_engine import _classify_topic_simple
+
+
+def _compute_topic_streak(tweets: list[str]) -> int:
+    """Count consecutive tweets from the end that share the same topic."""
+    if not tweets:
+        return 1
+    topics = [_classify_topic_simple(t) for t in tweets]
+    streak = 1
+    for i in range(len(topics) - 2, -1, -1):
+        if topics[i] == topics[-1]:
+            streak += 1
+        else:
+            break
+    return streak
 from market_impact import (
     get_sectors, get_topic_sector_matrix, get_impact_for_topic,
     simulate_market_reaction, generate_demo_trade_history, calculate_pnl,
@@ -761,6 +776,9 @@ result = run_agent_cycle(
     posted_1h_ago=posted_1h_ago,
     posted_2h_ago=posted_2h_ago,
     posted_3h_ago=posted_3h_ago,
+    last_post_text=recent_tweets[-1] if recent_tweets else "",
+    avg_post_length_session=sum(len(t) for t in recent_tweets) / max(len(recent_tweets), 1) if recent_tweets else 0.0,
+    topic_streak=_compute_topic_streak(recent_tweets),
 )
 
 prob = result["probability"]

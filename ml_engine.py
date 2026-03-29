@@ -46,6 +46,7 @@ warnings.filterwarnings("ignore")
 EST = pytz.timezone("America/New_York")
 MODELS_DIR = Path(__file__).parent / "models"
 MODEL_PATH = MODELS_DIR / "mentionbot_rf.joblib"
+BURST_MODEL_PATH = MODELS_DIR / "mentionbot_burst.joblib"
 METRICS_PATH = MODELS_DIR / "model_metrics.json"
 
 FEATURE_COLS = [
@@ -75,9 +76,74 @@ FEATURE_COLS = [
     "posted_1h_ago",
     "posted_2h_ago",
     "posted_3h_ago",
+    # Text-derived features from most recent post
+    "last_post_length",         # char count of last post
+    "last_post_caps_ratio",     # fraction of uppercase letters
+    "last_post_exclamations",   # number of '!'
+    "last_post_questions",      # number of '?'
+    "last_post_word_count",     # word count
+    "avg_post_length_session",  # avg length of posts in current session
+    # Content-derived features (backtestable from historical text)
+    "topic_streak",             # consecutive posts on the same topic (1=no streak)
+    "anger_score",              # count of trigger/rage words in last post
+    "name_drop_count",          # mentions of specific people in last post
 ]
 
 TOPIC_LABELS = ["Tariffs", "Crypto", "Media", "Borders", "Fed", "Cabinet", "Other"]
+
+# Anger/rage trigger words — when these appear, he's fired up and likely to keep posting
+ANGER_WORDS = {
+    "fake", "witch hunt", "hoax", "corrupt", "disaster", "terrible", "horrible",
+    "never", "worst", "stupid", "loser", "pathetic", "disgrace", "shame",
+    "rigged", "crooked", "radical", "destroy", "enemy", "traitor", "treason",
+    "weak", "incompetent", "fraud", "illegal", "crime", "attack", "liar",
+    "failing", "sad!", "bad!", "wrong", "unfair", "biased",
+}
+
+# Names he calls out — name-dropping = likely multi-post thread
+NAME_TARGETS = {
+    "biden", "obama", "pelosi", "schumer", "kamala", "harris", "desantis",
+    "pence", "mcconnell", "romney", "cheney", "hillary", "clinton",
+    "jack smith", "fani willis", "letitia james", "bragg",
+    "cnn", "msnbc", "nbc", "nyt", "new york times", "washington post",
+    "fox", "maddow", "anderson cooper",
+    "china", "xi", "putin", "zelensky", "iran",
+}
+
+# Simple keyword-based topic classifier for historical posts
+TOPIC_KEYWORDS = {
+    "Tariffs": {"tariff", "trade", "china", "import", "export", "duty", "duties", "customs", "wto"},
+    "Crypto": {"crypto", "bitcoin", "btc", "eth", "blockchain", "token", "digital currency"},
+    "Media": {"media", "press", "news", "cnn", "nbc", "journalist", "censor", "fake news"},
+    "Borders": {"border", "immigra", "deport", "migrant", "asylum", "ice ", "wall"},
+    "Fed": {"fed", "rate", "powell", "inflation", "interest", "monetary"},
+    "Cabinet": {"cabinet", "secretary", "nominate", "appoint", "confirm", "resign"},
+}
+
+
+def _classify_topic_simple(text: str) -> str:
+    """Fast keyword topic classification for a single post."""
+    text_lower = text.lower()
+    best_topic = "Other"
+    best_score = 0
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in text_lower)
+        if score > best_score:
+            best_score = score
+            best_topic = topic
+    return best_topic
+
+
+def _anger_score(text: str) -> int:
+    """Count anger/rage trigger words in text."""
+    text_lower = text.lower()
+    return sum(1 for w in ANGER_WORDS if w in text_lower)
+
+
+def _name_drop_count(text: str) -> int:
+    """Count mentions of specific people/outlets."""
+    text_lower = text.lower()
+    return sum(1 for n in NAME_TARGETS if n in text_lower)
 
 
 # ===========================================================================
@@ -332,6 +398,85 @@ def prep_data(csv_path: str, pre_ingested_df: pd.DataFrame | None = None) -> pd.
     hourly["posted_2h_ago"] = (hourly["post_count"].shift(2).fillna(0) > 0).astype(int)
     hourly["posted_3h_ago"] = (hourly["post_count"].shift(3).fillna(0) > 0).astype(int)
 
+    # ------------------------------------------------------------------
+    # 24-29. Text-derived features from the most recent post
+    # ------------------------------------------------------------------
+    # Compute per-post text features
+    df_raw["_text"] = df_raw["text"].astype(str)
+    df_raw["_len"] = df_raw["_text"].str.len()
+    df_raw["_word_count"] = df_raw["_text"].str.split().str.len()
+    df_raw["_caps_ratio"] = df_raw["_text"].apply(
+        lambda t: sum(1 for c in t if c.isupper()) / max(len(t), 1)
+    )
+    df_raw["_exclamations"] = df_raw["_text"].str.count("!")
+    df_raw["_questions"] = df_raw["_text"].str.count(r"\?")
+
+    # Aggregate per hour bucket: use the LAST post's features in each hour
+    text_agg = df_raw.groupby("hour_bucket").agg(
+        _last_len=("_len", "last"),
+        _last_caps=("_caps_ratio", "last"),
+        _last_exclam=("_exclamations", "last"),
+        _last_quest=("_questions", "last"),
+        _last_wc=("_word_count", "last"),
+        _avg_len=("_len", "mean"),
+    )
+    hourly = hourly.join(text_agg)
+
+    # Forward-fill: if no post this hour, carry forward from the most recent hour with a post
+    for col in ["_last_len", "_last_caps", "_last_exclam", "_last_quest", "_last_wc", "_avg_len"]:
+        hourly[col] = hourly[col].ffill().fillna(0)
+
+    # Shift by 1 so we only use data from BEFORE the current hour (no leakage)
+    hourly["last_post_length"] = hourly["_last_len"].shift(1).fillna(0)
+    hourly["last_post_caps_ratio"] = hourly["_last_caps"].shift(1).fillna(0)
+    hourly["last_post_exclamations"] = hourly["_last_exclam"].shift(1).fillna(0)
+    hourly["last_post_questions"] = hourly["_last_quest"].shift(1).fillna(0)
+    hourly["last_post_word_count"] = hourly["_last_wc"].shift(1).fillna(0)
+    hourly["avg_post_length_session"] = hourly["_avg_len"].shift(1).fillna(0)
+
+    # Clean up temp columns
+    hourly = hourly.drop(columns=["_last_len", "_last_caps", "_last_exclam",
+                                   "_last_quest", "_last_wc", "_avg_len"])
+
+    # ------------------------------------------------------------------
+    # 30-32. Content features: topic streak, anger, name-dropping
+    # ------------------------------------------------------------------
+    df_raw["_topic"] = df_raw["_text"].apply(_classify_topic_simple)
+    df_raw["_anger"] = df_raw["_text"].apply(_anger_score)
+    df_raw["_names"] = df_raw["_text"].apply(_name_drop_count)
+
+    # Topic streak: count consecutive posts with the same topic (per-post, then take last per hour)
+    streaks = []
+    prev_topic = None
+    cur_streak = 0
+    for _, row in df_raw.iterrows():
+        t = row["_topic"]
+        if t == prev_topic:
+            cur_streak += 1
+        else:
+            cur_streak = 1
+            prev_topic = t
+        streaks.append(cur_streak)
+    df_raw["_topic_streak"] = streaks
+
+    # Aggregate per hour: last post's anger/names/streak
+    content_agg = df_raw.groupby("hour_bucket").agg(
+        _last_anger=("_anger", "last"),
+        _last_names=("_names", "last"),
+        _last_streak=("_topic_streak", "last"),
+    )
+    hourly = hourly.join(content_agg)
+
+    for col in ["_last_anger", "_last_names", "_last_streak"]:
+        hourly[col] = hourly[col].ffill().fillna(0)
+
+    # Shift by 1 (only use past data)
+    hourly["anger_score"] = hourly["_last_anger"].shift(1).fillna(0)
+    hourly["name_drop_count"] = hourly["_last_names"].shift(1).fillna(0)
+    hourly["topic_streak"] = hourly["_last_streak"].shift(1).fillna(1)
+
+    hourly = hourly.drop(columns=["_last_anger", "_last_names", "_last_streak"])
+
     # Drop the last row (target shifted off the end)
     hourly = hourly.iloc[:-1].copy()
 
@@ -441,8 +586,44 @@ def train_model(df: pd.DataFrame) -> GradientBoostingClassifier:
         json.dump(metrics, f, indent=2)
 
     joblib.dump(clf, MODEL_PATH)
-    print(f"[train_model] Model saved -> {MODEL_PATH}")
+    print(f"[train_model] General model saved -> {MODEL_PATH}")
+
+    # -----------------------------------------------------------
+    # Train burst continuation model (only on rows where posted_1h_ago=1)
+    # -----------------------------------------------------------
+    burst_mask_tr = df.iloc[:split_idx]["posted_1h_ago"] == 1
+    burst_mask_te = df.iloc[split_idx:]["posted_1h_ago"] == 1
+
+    X_burst_tr = X_train[burst_mask_tr.values]
+    y_burst_tr = y_train[burst_mask_tr.values]
+    X_burst_te = X_test[burst_mask_te.values]
+    y_burst_te = y_test[burst_mask_te.values]
+
+    sw_burst = np.where(y_burst_tr == 1, 1.5, 1.0)
+    clf_burst = GradientBoostingClassifier(
+        n_estimators=400, max_depth=7, learning_rate=0.03,
+        min_samples_leaf=10, subsample=0.85, random_state=42,
+    )
+    clf_burst.fit(X_burst_tr, y_burst_tr, sample_weight=sw_burst)
+
+    burst_probs = clf_burst.predict_proba(X_burst_te)[:, 1]
+    burst_preds = (burst_probs >= 0.45).astype(int)
+    burst_prec = precision_score(y_burst_te, burst_preds, pos_label=1, zero_division=0)
+    burst_rec = recall_score(y_burst_te, burst_preds, pos_label=1, zero_division=0)
+    print(f"[train_model] Burst model (t=0.50): precision={burst_prec:.1%}  recall={burst_rec:.1%}")
+
+    joblib.dump(clf_burst, BURST_MODEL_PATH)
+    print(f"[train_model] Burst model saved -> {BURST_MODEL_PATH}")
+
+    # Add burst metrics
+    metrics["burst_precision"] = round(float(burst_prec), 4)
+    metrics["burst_recall"] = round(float(burst_rec), 4)
+    metrics["burst_base_rate"] = round(float(y_burst_te.mean()), 4)
+
+    with open(METRICS_PATH, "w") as f:
+        json.dump(metrics, f, indent=2)
     print(f"[train_model] Metrics saved -> {METRICS_PATH}")
+
     return clf
 
 
@@ -507,6 +688,23 @@ def get_news_boost() -> float:
         return 0.0
 
 
+def _extract_text_features(text: str) -> dict:
+    """Extract all text-derived features from a single post."""
+    text = str(text)
+    length = len(text)
+    words = text.split()
+    caps_count = sum(1 for c in text if c.isupper())
+    return {
+        "last_post_length": length,
+        "last_post_caps_ratio": caps_count / max(length, 1),
+        "last_post_exclamations": text.count("!"),
+        "last_post_questions": text.count("?"),
+        "last_post_word_count": len(words),
+        "anger_score": _anger_score(text),
+        "name_drop_count": _name_drop_count(text),
+    }
+
+
 def predict_live_probability(
     current_time_hour: int = 10,
     hours_since_last: float = 1.5,
@@ -519,17 +717,24 @@ def predict_live_probability(
     posted_1h_ago: int = 0,
     posted_2h_ago: int = 0,
     posted_3h_ago: int = 0,
+    last_post_text: str = "",
+    avg_post_length_session: float = 0.0,
+    topic_streak: int = 1,
 ) -> float:
     """
     Lightweight inference: load the saved model and return P(post in next hour).
-    Uses behavioral + session features — no lookup tables.
+    Uses behavioral, session, and text-derived features.
     """
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
             f"Model not found at {MODEL_PATH}. Run train_model() first."
         )
 
-    clf = joblib.load(MODEL_PATH)
+    # Use burst model when in an active posting session
+    if posted_1h_ago and BURST_MODEL_PATH.exists():
+        clf = joblib.load(BURST_MODEL_PATH)
+    else:
+        clf = joblib.load(MODEL_PATH)
 
     hour = current_time_hour
     if day_of_week is None:
@@ -543,15 +748,18 @@ def predict_live_probability(
     is_peak_hour = 1 if (7 <= hour <= 11) or (18 <= hour <= 23) else 0
     regime_flag = 1 if post_count_24h > 5 else 0
 
-    # Interaction features
     velocity_x_peak = posting_velocity_4h * is_peak_hour
     gap_x_peak = hours_since_last * is_peak_hour
     velocity_x_regime = posting_velocity_4h * regime_flag
-    posts_30min = posting_velocity_4h * 4  # proxy from velocity
+    posts_30min = posting_velocity_4h * 4
 
-    # Session features
     no_post_today_yet = 1 if posts_today == 0 else 0
     hours_since_first_today = hour - (hour - min(session_length, hour)) if posts_today > 0 else 0
+
+    # Text features from last post
+    tf = _extract_text_features(last_post_text)
+    if avg_post_length_session <= 0 and last_post_text:
+        avg_post_length_session = tf["last_post_length"]
 
     features = np.array([[
         hour_sin,
@@ -577,11 +785,19 @@ def predict_live_probability(
         posted_1h_ago,
         posted_2h_ago,
         posted_3h_ago,
+        tf["last_post_length"],
+        tf["last_post_caps_ratio"],
+        tf["last_post_exclamations"],
+        tf["last_post_questions"],
+        tf["last_post_word_count"],
+        avg_post_length_session,
+        topic_streak,
+        tf["anger_score"],
+        tf["name_drop_count"],
     ]])
 
     prob: float = clf.predict_proba(features)[0][1]
 
-    # Apply live news boost if available
     news_boost = get_news_boost()
     if news_boost > 0:
         prob = min(0.99, prob * (1.0 + news_boost))

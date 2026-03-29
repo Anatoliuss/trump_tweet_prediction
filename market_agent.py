@@ -187,6 +187,9 @@ def run_agent_cycle(
     posted_1h_ago: int = 0,
     posted_2h_ago: int = 0,
     posted_3h_ago: int = 0,
+    last_post_text: str = "",
+    avg_post_length_session: float = 0.0,
+    topic_streak: int = 1,
 ) -> dict:
     """
     Execute one full agent decision cycle:
@@ -214,6 +217,9 @@ def run_agent_cycle(
         posted_1h_ago=posted_1h_ago,
         posted_2h_ago=posted_2h_ago,
         posted_3h_ago=posted_3h_ago,
+        last_post_text=last_post_text,
+        avg_post_length_session=avg_post_length_session,
+        topic_streak=topic_streak,
     )
 
     # Step 2: topic prediction (only if base probability is above threshold)
