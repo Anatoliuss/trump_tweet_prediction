@@ -1,24 +1,22 @@
 """
-ml_engine.py — MentionBot Predictive Engine
-============================================
-Public API (import these in your agent script):
-  - prep_data(csv_path)                        -> pd.DataFrame
-  - train_model(df)                            -> RandomForestClassifier
-  - predict_live_probability(current_time,
-                             last_post_time,
-                             post_count_24h)   -> float  (0.0 – 1.0)
-  - predict_next_topic(last_5_tweets_list)     -> str    (one of TOPIC_LABELS)
+ml_engine.py — MentionBot Predictive Engine v2
+================================================
+Enhanced with 12+ features, GradientBoosting, and model metrics.
 
-PlanetScale-compatible schema:
-  timestamp       TEXT (ISO-8601 with tz)
-  text            TEXT
-  predicted_topic TEXT (one of TOPIC_LABELS | "")
-  probability_score REAL (0.0 – 1.0 | NULL)
+Public API:
+  - ingest_real_data(csv_path)                    -> pd.DataFrame
+  - prep_data(csv_path, pre_ingested_df)          -> pd.DataFrame
+  - train_model(df)                               -> GradientBoostingClassifier
+  - predict_live_probability(...)                  -> float  (0.0 – 1.0)
+  - predict_next_topic(last_5_tweets_list)         -> str
+  - get_model_metrics()                            -> dict
+  - get_hourly_heatmap_data(df)                    -> pd.DataFrame
 """
 
 from __future__ import annotations
 
 import os
+import json
 import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,9 +26,16 @@ import joblib
 import numpy as np
 import pandas as pd
 import pytz
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -40,12 +45,21 @@ warnings.filterwarnings("ignore")
 EST = pytz.timezone("America/New_York")
 MODELS_DIR = Path(__file__).parent / "models"
 MODEL_PATH = MODELS_DIR / "mentionbot_rf.joblib"
+METRICS_PATH = MODELS_DIR / "model_metrics.json"
 
 FEATURE_COLS = [
-    "hour_of_day",
-    "day_of_week",
+    "hour_sin",
+    "hour_cos",
+    "day_sin",
+    "day_cos",
+    "is_weekend",
+    "is_peak_hour",
     "hours_since_last_post",
     "rolling_post_count_24h",
+    "posting_velocity_4h",
+    "gap_acceleration",
+    "avg_posts_this_hour_hist",
+    "hour_of_day",
 ]
 
 TOPIC_LABELS = ["Tariffs", "Crypto", "Media", "Borders", "Fed", "Cabinet", "Other"]
@@ -59,16 +73,6 @@ def ingest_real_data(csv_path: str) -> pd.DataFrame:
     """
     Load any Trump Truth Social CSV, auto-detect columns, clean, and
     normalise to the canonical schema: (timestamp, text).
-
-    Handles:
-      - stiles/trump-truth-social-archive  (created_at, content)
-      - Kaggle Trump Tweets                (date/timestamp, text/tweet)
-      - Our own sample format              (timestamp, text)
-
-    Filters:
-      - Removes reblogs/retweets (RT prefix or reblogs_count > 0)
-      - Removes duplicates by text content
-      - Sorts chronologically
     """
     df = pd.read_csv(csv_path)
     original_count = len(df)
@@ -82,9 +86,7 @@ def ingest_real_data(csv_path: str) -> pd.DataFrame:
             ts_col = matches[0]
             break
     if ts_col is None:
-        raise ValueError(
-            f"Cannot detect timestamp column. Columns: {list(df.columns)}"
-        )
+        raise ValueError(f"Cannot detect timestamp column. Columns: {list(df.columns)}")
 
     # --- Auto-detect text column ---
     text_candidates = ["content", "text", "tweet", "body", "message", "post"]
@@ -95,20 +97,13 @@ def ingest_real_data(csv_path: str) -> pd.DataFrame:
             text_col = matches[0]
             break
     if text_col is None:
-        raise ValueError(
-            f"Cannot detect text column. Columns: {list(df.columns)}"
-        )
+        raise ValueError(f"Cannot detect text column. Columns: {list(df.columns)}")
 
     print(f"[ingest] Detected columns: timestamp='{ts_col}', text='{text_col}'")
 
-    # --- Rename to canonical schema ---
     df = df.rename(columns={ts_col: "timestamp", text_col: "text"})
 
-    # --- Remove reblogs/retweets ---
-    # Note: reblogs_count in the stiles archive = how many times OTHERS shared
-    # the post, NOT whether the post itself is a reblog. Use RT prefix instead.
-
-    # Remove RT-prefixed posts
+    # --- Remove RT-prefixed posts ---
     df["text"] = df["text"].astype(str)
     before = len(df)
     df = df[~df["text"].str.startswith("RT @", na=False)].copy()
@@ -125,11 +120,10 @@ def ingest_real_data(csv_path: str) -> pd.DataFrame:
     if before - len(df) > 0:
         print(f"[ingest] Removed {before - len(df)} duplicate posts")
 
-    # --- Parse timestamps, coerce errors ---
+    # --- Parse timestamps ---
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"])
 
-    # Keep only timestamp and text (+ any extra columns for PlanetScale)
     df = df[["timestamp", "text"]].sort_values("timestamp").reset_index(drop=True)
 
     print(
@@ -142,16 +136,7 @@ def ingest_real_data(csv_path: str) -> pd.DataFrame:
 
 def prep_data(csv_path: str, pre_ingested_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
-    Load historical Truth Social posts CSV and return an hourly feature matrix.
-
-    Args:
-        csv_path: path to CSV (used when pre_ingested_df is None)
-        pre_ingested_df: optional pre-cleaned DataFrame with (timestamp, text)
-                         — skips CSV loading + column detection if provided.
-
-    Returns a DataFrame indexed by EST hour with columns:
-      hour_of_day, day_of_week, hours_since_last_post,
-      rolling_post_count_24h, posted_in_next_hour (target)
+    Load historical posts and return an hourly feature matrix with 12 features.
     """
     # ------------------------------------------------------------------
     # 1. Load & parse timestamps
@@ -163,46 +148,59 @@ def prep_data(csv_path: str, pre_ingested_df: pd.DataFrame | None = None) -> pd.
         df_raw = pd.read_csv(csv_path)
         df_raw["timestamp"] = pd.to_datetime(df_raw["timestamp"], utc=True)
 
-    # Localise to EST (handles DST automatically)
     df_raw["timestamp_est"] = df_raw["timestamp"].dt.tz_convert(EST)
     df_raw = df_raw.sort_values("timestamp_est").reset_index(drop=True)
 
     # ------------------------------------------------------------------
-    # 2. Build a complete hourly spine covering the full date range
+    # 2. Build hourly spine
     # ------------------------------------------------------------------
     floor_start = df_raw["timestamp_est"].iloc[0].floor("h")
-    floor_end   = df_raw["timestamp_est"].iloc[-1].floor("h")
+    floor_end = df_raw["timestamp_est"].iloc[-1].floor("h")
 
     hourly_index = pd.date_range(floor_start, floor_end, freq="h", tz=EST)
     hourly = pd.DataFrame(index=hourly_index)
 
-    # Posts per hour (raw count)
-    # Floor in UTC first (no DST ambiguity), then convert to EST for grouping
-    df_raw["hour_bucket"] = (
-        df_raw["timestamp"].dt.floor("h").dt.tz_convert(EST)
-    )
-    post_counts = (
-        df_raw.groupby("hour_bucket").size().rename("post_count")
-    )
+    df_raw["hour_bucket"] = df_raw["timestamp"].dt.floor("h").dt.tz_convert(EST)
+    post_counts = df_raw.groupby("hour_bucket").size().rename("post_count")
     hourly = hourly.join(post_counts).fillna(0)
     hourly["post_count"] = hourly["post_count"].astype(int)
 
     # ------------------------------------------------------------------
-    # 3. Target: did any post appear in the *next* hour?
+    # 3. Target: posted in next hour?
     # ------------------------------------------------------------------
     hourly["posted_in_next_hour"] = (
         hourly["post_count"].shift(-1).fillna(0).gt(0).astype(int)
     )
 
     # ------------------------------------------------------------------
-    # 4. Feature: hour_of_day, day_of_week
+    # 4. Basic time features
     # ------------------------------------------------------------------
-    hourly["hour_of_day"] = hourly.index.hour          # 0–23
-    hourly["day_of_week"]  = hourly.index.dayofweek    # 0=Mon … 6=Sun
+    hourly["hour_of_day"] = hourly.index.hour
+    hourly["day_of_week"] = hourly.index.dayofweek
 
     # ------------------------------------------------------------------
-    # 5. Feature: hours_since_last_post
-    #    Walk forward tracking the last hour that had ≥1 post.
+    # 5. Cyclical encoding (sin/cos) for hour and day
+    # ------------------------------------------------------------------
+    hourly["hour_sin"] = np.sin(2 * np.pi * hourly["hour_of_day"] / 24)
+    hourly["hour_cos"] = np.cos(2 * np.pi * hourly["hour_of_day"] / 24)
+    hourly["day_sin"] = np.sin(2 * np.pi * hourly["day_of_week"] / 7)
+    hourly["day_cos"] = np.cos(2 * np.pi * hourly["day_of_week"] / 7)
+
+    # ------------------------------------------------------------------
+    # 6. Weekend flag
+    # ------------------------------------------------------------------
+    hourly["is_weekend"] = (hourly["day_of_week"] >= 5).astype(int)
+
+    # ------------------------------------------------------------------
+    # 7. Peak hour flag (7-11am, 6-11pm EST)
+    # ------------------------------------------------------------------
+    hourly["is_peak_hour"] = (
+        ((hourly["hour_of_day"] >= 7) & (hourly["hour_of_day"] <= 11))
+        | ((hourly["hour_of_day"] >= 18) & (hourly["hour_of_day"] <= 23))
+    ).astype(int)
+
+    # ------------------------------------------------------------------
+    # 8. hours_since_last_post
     # ------------------------------------------------------------------
     hours_since = []
     last_seen: Optional[datetime] = None
@@ -216,22 +214,46 @@ def prep_data(csv_path: str, pre_ingested_df: pd.DataFrame | None = None) -> pd.
             last_seen = ts
 
     hourly["hours_since_last_post"] = hours_since
-    # Fill the initial NaN with the dataset median so the model has a value
     median_gap = pd.Series(hours_since).median()
     hourly["hours_since_last_post"] = hourly["hours_since_last_post"].fillna(median_gap)
 
     # ------------------------------------------------------------------
-    # 6. Feature: rolling_post_count_24h
-    #    Sum of posts in the 24 hours *ending at* (not including) this hour.
+    # 9. rolling_post_count_24h
     # ------------------------------------------------------------------
     hourly["rolling_post_count_24h"] = (
         hourly["post_count"]
         .rolling(window=24, min_periods=1)
         .sum()
-        .shift(1)           # exclude current hour → look-back only
+        .shift(1)
         .fillna(0)
         .astype(int)
     )
+
+    # ------------------------------------------------------------------
+    # 10. posting_velocity_4h (posts per hour in last 4 hours)
+    # ------------------------------------------------------------------
+    hourly["posting_velocity_4h"] = (
+        hourly["post_count"]
+        .rolling(window=4, min_periods=1)
+        .mean()
+        .shift(1)
+        .fillna(0)
+    )
+
+    # ------------------------------------------------------------------
+    # 11. gap_acceleration — change in hours_since_last_post
+    #     Positive = gaps getting larger (slowing down)
+    #     Negative = gaps getting smaller (speeding up)
+    # ------------------------------------------------------------------
+    hourly["gap_acceleration"] = (
+        hourly["hours_since_last_post"].diff().fillna(0)
+    )
+
+    # ------------------------------------------------------------------
+    # 12. avg_posts_this_hour_hist — historical average for this hour
+    # ------------------------------------------------------------------
+    hour_means = hourly.groupby("hour_of_day")["post_count"].transform("mean")
+    hourly["avg_posts_this_hour_hist"] = hour_means
 
     # Drop the last row (target shifted off the end)
     hourly = hourly.iloc[:-1].copy()
@@ -247,12 +269,10 @@ def prep_data(csv_path: str, pre_ingested_df: pd.DataFrame | None = None) -> pd.
 # STEP 2 — TRAIN & INFERENCE
 # ===========================================================================
 
-def train_model(df: pd.DataFrame) -> RandomForestClassifier:
+def train_model(df: pd.DataFrame) -> GradientBoostingClassifier:
     """
-    Train a RandomForestClassifier on the engineered hourly feature matrix.
-
-    Saves the fitted model to models/mentionbot_rf.joblib.
-    Returns the fitted classifier.
+    Train a GradientBoostingClassifier on the enhanced feature matrix.
+    Saves model + metrics to models/ directory.
     """
     MODELS_DIR.mkdir(exist_ok=True)
 
@@ -263,72 +283,118 @@ def train_model(df: pd.DataFrame) -> RandomForestClassifier:
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    clf = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=8,
-        min_samples_leaf=5,
-        class_weight="balanced",   # handles the natural class imbalance
+    # Compute sample weights to handle class imbalance
+    # Posts are ~22% of data, so upweight them ~3x
+    sample_weights = np.where(y_train == 1, 3.0, 1.0)
+
+    clf = GradientBoostingClassifier(
+        n_estimators=400,
+        max_depth=5,
+        learning_rate=0.08,
+        min_samples_leaf=15,
+        subsample=0.85,
         random_state=42,
-        n_jobs=-1,
     )
-    clf.fit(X_train, y_train)
+    clf.fit(X_train, y_train, sample_weight=sample_weights)
 
     # Evaluation
     y_pred = clf.predict(X_test)
-    print("[train_model] Classification report on held-out test set:")
-    print(classification_report(y_test, y_pred, target_names=["no_post", "post"]))
+    y_prob = clf.predict_proba(X_test)[:, 1]
 
-    # Feature importance summary
+    report = classification_report(y_test, y_pred, target_names=["no_post", "post"])
+    print("[train_model] Classification report on held-out test set:")
+    print(report)
+
+    # Feature importance
     importances = dict(zip(FEATURE_COLS, clf.feature_importances_))
     print("[train_model] Feature importances:")
     for feat, imp in sorted(importances.items(), key=lambda x: -x[1]):
         print(f"  {feat:30s} {imp:.3f}")
 
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+
+    # Save metrics for dashboard
+    metrics = {
+        "accuracy": float(accuracy_score(y_test, y_pred)),
+        "precision_post": float(precision_score(y_test, y_pred, pos_label=1)),
+        "recall_post": float(recall_score(y_test, y_pred, pos_label=1)),
+        "f1_post": float(f1_score(y_test, y_pred, pos_label=1)),
+        "confusion_matrix": cm.tolist(),
+        "feature_importances": {k: round(v, 4) for k, v in importances.items()},
+        "n_train": int(len(X_train)),
+        "n_test": int(len(X_test)),
+        "positive_rate": float(y.mean()),
+        "classification_report": report,
+    }
+
+    with open(METRICS_PATH, "w") as f:
+        json.dump(metrics, f, indent=2)
+
     joblib.dump(clf, MODEL_PATH)
     print(f"[train_model] Model saved -> {MODEL_PATH}")
+    print(f"[train_model] Metrics saved -> {METRICS_PATH}")
     return clf
 
 
 def predict_live_probability(
-    current_time: datetime,
-    last_post_time: datetime,
-    post_count_24h: int,
+    current_time_hour: int = 10,
+    hours_since_last: float = 1.5,
+    post_count_24h: int = 8,
+    posting_velocity_4h: float = 0.5,
+    gap_acceleration: float = 0.0,
+    day_of_week: int | None = None,
 ) -> float:
     """
     Lightweight inference: load the saved model and return P(post in next hour).
 
-    Args:
-        current_time:   aware datetime (any tz; converted internally to EST)
-        last_post_time: aware datetime of the most recent post
-        post_count_24h: number of posts in the last 24 h (rolling)
-
-    Returns:
-        float in [0.0, 1.0] — e.g. 0.82 means 82 % probability
+    Accepts simple numeric inputs (no datetime objects needed for dashboard use).
     """
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
             f"Model not found at {MODEL_PATH}. Run train_model() first."
         )
 
-    clf: RandomForestClassifier = joblib.load(MODEL_PATH)
+    clf = joblib.load(MODEL_PATH)
 
-    # Normalise to EST
-    ct  = current_time.astimezone(EST)
-    lpt = last_post_time.astimezone(EST)
+    hour = current_time_hour
+    if day_of_week is None:
+        day_of_week = datetime.now(tz=EST).weekday()
 
-    hour_of_day         = ct.hour
-    day_of_week         = ct.weekday()
-    hours_since_last    = (ct - lpt).total_seconds() / 3600
-    rolling_post_count  = int(post_count_24h)
+    # Compute all features
+    hour_sin = np.sin(2 * np.pi * hour / 24)
+    hour_cos = np.cos(2 * np.pi * hour / 24)
+    day_sin = np.sin(2 * np.pi * day_of_week / 7)
+    day_cos = np.cos(2 * np.pi * day_of_week / 7)
+    is_weekend = 1 if day_of_week >= 5 else 0
+    is_peak_hour = 1 if (7 <= hour <= 11) or (18 <= hour <= 23) else 0
+
+    # Historical average posts per hour (rough estimate if not available)
+    # Based on data: ~0.55 posts/hour overall, peaks at ~1.2
+    peak_hours_avg = {
+        0: 0.4, 1: 0.2, 2: 0.05, 3: 0.02, 4: 0.01, 5: 0.02,
+        6: 0.1, 7: 0.5, 8: 0.8, 9: 1.0, 10: 1.1, 11: 1.0,
+        12: 0.8, 13: 0.7, 14: 0.7, 15: 0.6, 16: 0.6, 17: 0.7,
+        18: 0.8, 19: 0.9, 20: 1.0, 21: 1.1, 22: 0.9, 23: 0.6,
+    }
+    avg_posts_this_hour_hist = peak_hours_avg.get(hour, 0.5)
 
     features = np.array([[
-        hour_of_day,
-        day_of_week,
+        hour_sin,
+        hour_cos,
+        day_sin,
+        day_cos,
+        is_weekend,
+        is_peak_hour,
         hours_since_last,
-        rolling_post_count,
+        post_count_24h,
+        posting_velocity_4h,
+        gap_acceleration,
+        avg_posts_this_hour_hist,
+        hour,
     ]])
 
-    prob: float = clf.predict_proba(features)[0][1]   # P(class=1)
+    prob: float = clf.predict_proba(features)[0][1]
     return round(float(prob), 4)
 
 
@@ -339,19 +405,13 @@ def predict_live_probability(
 def predict_next_topic(last_5_tweets_list: list[str]) -> str:
     """
     Use GPT-4o-mini to classify what topic Trump will post about next.
-
-    Args:
-        last_5_tweets_list: list of up to 5 recent post strings (newest last)
-
-    Returns:
-        One of: Tariffs | Crypto | Media | Borders | Fed | Cabinet | Other
     """
     try:
         from openai import OpenAI
     except ImportError:
         raise ImportError("Run: pip install openai")
 
-    client = OpenAI()  # reads OPENAI_API_KEY from environment
+    client = OpenAI()
 
     numbered_tweets = "\n".join(
         f"{i+1}. {t}" for i, t in enumerate(last_5_tweets_list[-5:])
@@ -379,7 +439,7 @@ def predict_next_topic(last_5_tweets_list: list[str]) -> str:
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         temperature=0.0,
         max_tokens=10,
@@ -387,17 +447,53 @@ def predict_next_topic(last_5_tweets_list: list[str]) -> str:
 
     raw = response.choices[0].message.content.strip()
 
-    # Guard: ensure the model returned a valid label
     for label in TOPIC_LABELS:
         if label.lower() == raw.lower():
             return label
-
-    # Fallback: partial match
     for label in TOPIC_LABELS:
         if label.lower() in raw.lower():
             return label
-
     return "Other"
+
+
+# ===========================================================================
+# STEP 4 — MODEL METRICS & HEATMAP HELPERS
+# ===========================================================================
+
+def get_model_metrics() -> dict:
+    """Load saved model metrics for dashboard display."""
+    if METRICS_PATH.exists():
+        with open(METRICS_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def get_hourly_heatmap_data(csv_path: str = None, pre_ingested_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    Build hour-of-day × day-of-week heatmap of posting frequency.
+    Returns a 24×7 DataFrame (index=hour 0-23, columns=day 0-6).
+    """
+    if pre_ingested_df is not None:
+        df = pre_ingested_df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    elif csv_path:
+        df = ingest_real_data(csv_path)
+    else:
+        return pd.DataFrame()
+
+    df["ts_est"] = df["timestamp"].dt.tz_convert(EST)
+    df["hour"] = df["ts_est"].dt.hour
+    df["dow"] = df["ts_est"].dt.dayofweek
+
+    heatmap = df.groupby(["hour", "dow"]).size().unstack(fill_value=0)
+    # Normalize to average posts per hour per day
+    total_weeks = max(1, (df["ts_est"].max() - df["ts_est"].min()).days / 7)
+    heatmap = (heatmap / total_weeks).round(2)
+
+    # Ensure all hours and days are present
+    heatmap = heatmap.reindex(index=range(24), columns=range(7), fill_value=0.0)
+
+    return heatmap
 
 
 # ===========================================================================
@@ -412,7 +508,6 @@ if __name__ == "__main__":
 
     csv_path = sys.argv[1] if len(sys.argv) > 1 else REAL_DATA_PATH
 
-    # --- Prefer real data; fall back to synthetic only if unavailable ---
     if Path(csv_path).exists():
         print(f"[ml_engine] Loading REAL dataset: {csv_path}")
         clean_df = ingest_real_data(csv_path)
@@ -427,7 +522,7 @@ if __name__ == "__main__":
         clean_df = None
         csv_path = FALLBACK_DATA_PATH
 
-    # --- Step 1: Feature engineering ---
+    # Step 1: Feature engineering
     df = prep_data(csv_path, pre_ingested_df=clean_df)
     print()
     print("=== SUMMARY ===")
@@ -436,49 +531,35 @@ if __name__ == "__main__":
     print(f"  Positive rate:     {df['posted_in_next_hour'].mean():.1%}")
     print()
 
-    # --- Step 2: Train ---
+    # Step 2: Train
     clf = train_model(df)
 
-    # --- 5 example live predictions across different scenarios ---
-    print("\n=== 5 EXAMPLE LIVE PREDICTIONS ===")
+    # Step 3: Example predictions
+    print("\n=== EXAMPLE LIVE PREDICTIONS ===")
     scenarios = [
-        ("Morning burst (9am, posted 15min ago, 12 posts/24h)",
-         datetime(2025, 3, 1, 9, 0, tzinfo=EST),
-         datetime(2025, 3, 1, 8, 45, tzinfo=EST), 12),
-        ("Late night (11pm, posted 1h ago, 8 posts/24h)",
-         datetime(2025, 3, 1, 23, 0, tzinfo=EST),
-         datetime(2025, 3, 1, 22, 0, tzinfo=EST), 8),
-        ("Dead zone (4am, posted 5h ago, 3 posts/24h)",
-         datetime(2025, 3, 1, 4, 0, tzinfo=EST),
-         datetime(2025, 2, 28, 23, 0, tzinfo=EST), 3),
-        ("Afternoon quiet (2pm, posted 3h ago, 6 posts/24h)",
-         datetime(2025, 3, 1, 14, 0, tzinfo=EST),
-         datetime(2025, 3, 1, 11, 0, tzinfo=EST), 6),
-        ("Evening peak (7pm, posted 20min ago, 15 posts/24h)",
-         datetime(2025, 3, 1, 19, 0, tzinfo=EST),
-         datetime(2025, 3, 1, 18, 40, tzinfo=EST), 15),
+        ("Morning burst (9am, 0.25h since, 12 posts/24h)", 9, 0.25, 12, 2.0, -0.5),
+        ("Late night (11pm, 1h since, 8 posts/24h)", 23, 1.0, 8, 0.5, 0.5),
+        ("Dead zone (4am, 5h since, 3 posts/24h)", 4, 5.0, 3, 0.0, 1.0),
+        ("Afternoon quiet (2pm, 3h since, 6 posts/24h)", 14, 3.0, 6, 0.25, 0.5),
+        ("Evening peak (7pm, 0.3h since, 15 posts/24h)", 19, 0.3, 15, 3.0, -1.0),
     ]
 
-    for label, now, last, count in scenarios:
-        prob = predict_live_probability(now, last, count)
+    for label, hour, since, count, vel, accel in scenarios:
+        prob = predict_live_probability(hour, since, count, vel, accel)
         print(f"  {label}")
         print(f"    -> P(post next hour) = {prob:.2%}")
     print()
 
-    # --- Step 3 (optional — requires OPENAI_API_KEY) ---
+    # Step 4: Topic prediction (optional)
     if os.getenv("OPENAI_API_KEY") and clean_df is not None:
         last_5 = clean_df["text"].tail(5).tolist()
         topic = predict_next_topic(last_5)
         print(f"[predict_next_topic] Based on 5 most recent REAL posts: {topic}")
-    elif os.getenv("OPENAI_API_KEY"):
-        sample_tweets = [
-            "The fake news media is at it again. Total witch hunt!",
-            "Bitcoin is the future. We love Crypto!",
-            "Tariffs on China will make America RICH again.",
-            "Our borders are being invaded. We will stop it!",
-            "The Federal Reserve must lower rates NOW. Terrible leadership!",
-        ]
-        topic = predict_next_topic(sample_tweets)
-        print(f"[predict_next_topic] Predicted next topic: {topic}")
     else:
         print("[predict_next_topic] Skipped (set OPENAI_API_KEY to enable).")
+
+    # Step 5: Heatmap data
+    if clean_df is not None:
+        heatmap = get_hourly_heatmap_data(pre_ingested_df=clean_df)
+        print(f"\n[heatmap] Shape: {heatmap.shape}")
+        print(heatmap.head())

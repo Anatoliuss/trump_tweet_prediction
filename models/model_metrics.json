@@ -1,0 +1,34 @@
+{
+  "accuracy": 0.6217384591631928,
+  "precision_post": 0.3348883705431523,
+  "recall_post": 0.6888279643591501,
+  "f1_post": 0.45067264573991034,
+  "confusion_matrix": [
+    [
+      3022,
+      1996
+    ],
+    [
+      454,
+      1005
+    ]
+  ],
+  "feature_importances": {
+    "hour_sin": 0.0312,
+    "hour_cos": 0.0458,
+    "day_sin": 0.0412,
+    "day_cos": 0.0311,
+    "is_weekend": 0.0055,
+    "is_peak_hour": 0.006,
+    "hours_since_last_post": 0.1701,
+    "rolling_post_count_24h": 0.1576,
+    "posting_velocity_4h": 0.0672,
+    "gap_acceleration": 0.0453,
+    "avg_posts_this_hour_hist": 0.0553,
+    "hour_of_day": 0.3437
+  },
+  "n_train": 25906,
+  "n_test": 6477,
+  "positive_rate": 0.22524163913164313,
+  "classification_report": "              precision    recall  f1-score   support\n\n     no_post       0.87      0.60      0.71      5018\n        post       0.33      0.69      0.45      1459\n\n    accuracy                           0.62      6477\n   macro avg       0.60      0.65      0.58      6477\nweighted avg       0.75      0.62      0.65      6477\n"
+}

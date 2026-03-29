@@ -67,7 +67,7 @@ def generate_posts(n: int = 100, seed: int = 42) -> list[dict]:
         text = template.format(topic=topic_phrase, name=random.choice(NAMES))
 
         posts.append({
-            "timestamp": post_dt.isoformat(),
+            "timestamp": post_dt.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "text": text,
             "predicted_topic": "",        # filled by pipeline
             "probability_score": None,    # filled by pipeline
