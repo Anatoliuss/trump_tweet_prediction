@@ -500,7 +500,8 @@ def predict_next_topic(last_5_tweets_list: list[str]) -> str:
     except ImportError:
         raise ImportError("Run: pip install google-generativeai")
 
-    genai.configure(api_key="AIzaSyCLExluAagAMELIHiJejWQT_GaBbC8rerc")
+    import os
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
     model = genai.GenerativeModel("gemini-2.5-flash")
 
     numbered_tweets = "\n".join(

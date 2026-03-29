@@ -7,6 +7,9 @@ regime detection, VIX/DXY feedback, and news context.
 Launch:  python -m streamlit run app.py
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
