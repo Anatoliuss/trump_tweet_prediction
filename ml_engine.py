@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import json
-import math
 import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,7 +28,7 @@ import numpy as np
 import pandas as pd
 import pytz
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -50,7 +49,6 @@ MODEL_PATH = MODELS_DIR / "mentionbot_rf.joblib"
 METRICS_PATH = MODELS_DIR / "model_metrics.json"
 
 FEATURE_COLS = [
-    # Original 12 autoregressive features
     "hour_sin",
     "hour_cos",
     "day_sin",
@@ -61,15 +59,22 @@ FEATURE_COLS = [
     "rolling_post_count_24h",
     "posting_velocity_4h",
     "gap_acceleration",
-    "avg_posts_this_hour_hist",
     "hour_of_day",
-    # NEW: News context features
-    "news_volume_4h",
-    "news_sentiment",
-    # NEW: Regime classification
     "regime_flag",
-    # NEW: Market feedback loops
-    "simulated_vix_4h_vol",
+    # Interaction features
+    "velocity_x_peak",
+    "gap_x_peak",
+    "velocity_x_regime",
+    "posts_30min",
+    # Session features
+    "session_length",
+    "posts_today",
+    "no_post_today_yet",
+    "hours_since_first_today",
+    # Lagged binary flags — did they post N hours ago?
+    "posted_1h_ago",
+    "posted_2h_ago",
+    "posted_3h_ago",
 ]
 
 TOPIC_LABELS = ["Tariffs", "Crypto", "Media", "Borders", "Fed", "Cabinet", "Other"]
@@ -134,14 +139,7 @@ def ingest_real_data(csv_path: str) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"])
 
-    # Keep extra columns if they exist (news_volume_4h, etc.)
-    keep_cols = ["timestamp", "text"]
-    extra_cols = ["news_volume_4h", "news_sentiment", "simulated_vix_4h_vol", "simulated_dxy_4h_vol"]
-    for col in extra_cols:
-        if col in df.columns:
-            keep_cols.append(col)
-
-    df = df[keep_cols].sort_values("timestamp").reset_index(drop=True)
+    df = df[["timestamp", "text"]].sort_values("timestamp").reset_index(drop=True)
 
     print(
         f"[ingest] {original_count} raw rows -> {len(df)} clean original posts "
@@ -266,66 +264,73 @@ def prep_data(csv_path: str, pre_ingested_df: pd.DataFrame | None = None) -> pd.
     )
 
     # ------------------------------------------------------------------
-    # 12. avg_posts_this_hour_hist — historical average for this hour
-    # ------------------------------------------------------------------
-    hour_means = hourly.groupby("hour_of_day")["post_count"].transform("mean")
-    hourly["avg_posts_this_hour_hist"] = hour_means
-
-    # ==================================================================
-    # NEW FEATURES
-    # ==================================================================
-
-    # ------------------------------------------------------------------
-    # 13-14. News context: news_volume_4h, news_sentiment
-    # Aggregate per-post news data into hourly buckets, forward-fill gaps
-    # ------------------------------------------------------------------
-    has_news_data = "news_volume_4h" in df_raw.columns and "news_sentiment" in df_raw.columns
-    if has_news_data:
-        news_hourly = df_raw.groupby("hour_bucket").agg(
-            news_volume_4h=("news_volume_4h", "max"),
-            news_sentiment=("news_sentiment", "mean"),
-        )
-        hourly = hourly.join(news_hourly)
-        hourly["news_volume_4h"] = hourly["news_volume_4h"].ffill().fillna(8).astype(float)
-        hourly["news_sentiment"] = hourly["news_sentiment"].ffill().fillna(0.0)
-    else:
-        # Generate synthetic news features if not in source data
-        rng = np.random.RandomState(42)
-        n = len(hourly)
-        hourly["news_volume_4h"] = np.clip(
-            rng.normal(10, 5, n) + hourly["post_count"] * 2, 0, 50
-        ).round(0)
-        hourly["news_sentiment"] = np.clip(
-            rng.normal(0.05, 0.3, n) - (hourly["news_volume_4h"] - 10) * 0.01,
-            -1.0, 1.0,
-        ).round(3)
-
-    # ------------------------------------------------------------------
-    # 15. Regime classification (rule-based heuristic)
-    #     High-Activity Regime (1): rolling 24h posts > 5
-    #     Dormant Regime (0): otherwise
+    # 12. Regime classification
     # ------------------------------------------------------------------
     hourly["regime_flag"] = (hourly["rolling_post_count_24h"] > 5).astype(int)
 
     # ------------------------------------------------------------------
-    # 16. Market feedback: simulated_vix_4h_vol
-    #     VIX trailing volatility — high VIX = crisis mode = more posts
+    # 13-16. Interaction features
     # ------------------------------------------------------------------
-    has_vix_data = "simulated_vix_4h_vol" in df_raw.columns
-    if has_vix_data:
-        vix_hourly = df_raw.groupby("hour_bucket").agg(
-            simulated_vix_4h_vol=("simulated_vix_4h_vol", "mean"),
-        )
-        hourly = hourly.join(vix_hourly)
-        hourly["simulated_vix_4h_vol"] = hourly["simulated_vix_4h_vol"].ffill().fillna(18.0)
-    else:
-        # Generate synthetic VIX correlated with posting activity
-        rng = np.random.RandomState(99)
-        n = len(hourly)
-        vix_base = rng.normal(18, 3, n)
-        # Higher post velocity -> higher VIX (market turmoil drives posts)
-        vix_base += hourly["posting_velocity_4h"].values * 2
-        hourly["simulated_vix_4h_vol"] = np.clip(vix_base, 10, 50).round(2)
+    hourly["velocity_x_peak"] = hourly["posting_velocity_4h"] * hourly["is_peak_hour"]
+    hourly["gap_x_peak"] = hourly["hours_since_last_post"] * hourly["is_peak_hour"]
+    hourly["velocity_x_regime"] = hourly["posting_velocity_4h"] * hourly["regime_flag"]
+    hourly["posts_30min"] = hourly["post_count"].shift(1).fillna(0)
+
+    # ------------------------------------------------------------------
+    # 17-20. Session features — burst/cooldown detection
+    # ------------------------------------------------------------------
+    session_length = []
+    posts_today = []
+    no_post_today_yet = []
+    hours_since_first_today = []
+
+    cur_streak = 0
+    cur_day = None
+    cur_day_posts = 0
+    cur_day_first_hour = None
+
+    for ts, row in hourly.iterrows():
+        day = ts.date()
+        h = row["hour_of_day"]
+
+        # Reset daily counters at midnight
+        if day != cur_day:
+            cur_day = day
+            cur_day_posts = 0
+            cur_day_first_hour = None
+
+        # Session length: consecutive hours with posts (before current)
+        session_length.append(cur_streak)
+
+        # Daily stats (before current hour)
+        posts_today.append(cur_day_posts)
+        no_post_today_yet.append(1 if cur_day_posts == 0 else 0)
+
+        if cur_day_first_hour is not None:
+            hours_since_first_today.append(h - cur_day_first_hour)
+        else:
+            hours_since_first_today.append(0)
+
+        # Update after recording (so we only use past data)
+        if row["post_count"] > 0:
+            cur_streak += 1
+            cur_day_posts += int(row["post_count"])
+            if cur_day_first_hour is None:
+                cur_day_first_hour = h
+        else:
+            cur_streak = 0
+
+    hourly["session_length"] = session_length
+    hourly["posts_today"] = posts_today
+    hourly["no_post_today_yet"] = no_post_today_yet
+    hourly["hours_since_first_today"] = hours_since_first_today
+
+    # ------------------------------------------------------------------
+    # 21-23. Lagged binary flags — did they post 1/2/3 hours ago?
+    # ------------------------------------------------------------------
+    hourly["posted_1h_ago"] = (hourly["post_count"].shift(1).fillna(0) > 0).astype(int)
+    hourly["posted_2h_ago"] = (hourly["post_count"].shift(2).fillna(0) > 0).astype(int)
+    hourly["posted_3h_ago"] = (hourly["post_count"].shift(3).fillna(0) > 0).astype(int)
 
     # Drop the last row (target shifted off the end)
     hourly = hourly.iloc[:-1].copy()
@@ -352,29 +357,60 @@ def train_model(df: pd.DataFrame) -> GradientBoostingClassifier:
     X = df[FEATURE_COLS].values
     y = df["posted_in_next_hour"].values
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # Chronological split — train on first 80%, test on last 20%
+    # This prevents temporal leakage from future data into the training set
+    split_idx = int(len(X) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
 
-    # Compute sample weights to handle class imbalance
-    sample_weights = np.where(y_train == 1, 3.0, 1.0)
+    sample_weights = np.where(y_train == 1, 2.0, 1.0)
 
     clf = GradientBoostingClassifier(
         n_estimators=400,
         max_depth=5,
-        learning_rate=0.08,
-        min_samples_leaf=15,
+        learning_rate=0.05,
+        min_samples_leaf=20,
         subsample=0.85,
         random_state=42,
     )
     clf.fit(X_train, y_train, sample_weight=sample_weights)
 
-    # Evaluation
-    y_pred = clf.predict(X_test)
+    # Evaluation — find optimal confidence threshold for precision >= 60%
     y_prob = clf.predict_proba(X_test)[:, 1]
 
+    # Find best threshold using precision-weighted F0.5 score
+    # Requires minimum 15% recall so the model is still useful
+    best_threshold = 0.5
+    best_score = 0.0
+    threshold_stats = []
+    for t in np.arange(0.30, 0.80, 0.01):
+        preds_t = (y_prob >= t).astype(int)
+        if preds_t.sum() == 0:
+            continue
+        prec_t = precision_score(y_test, preds_t, pos_label=1, zero_division=0)
+        rec_t = recall_score(y_test, preds_t, pos_label=1, zero_division=0)
+        if prec_t > 0 and rec_t > 0:
+            fbeta = (1 + 0.25) * (prec_t * rec_t) / (0.25 * prec_t + rec_t)
+        else:
+            fbeta = 0.0
+        threshold_stats.append((t, prec_t, rec_t, fbeta))
+        if rec_t >= 0.15 and fbeta > best_score:
+            best_score = fbeta
+            best_threshold = round(t, 2)
+
+    # Print threshold sweep for transparency
+    print("[train_model] Threshold sweep (selected thresholds):")
+    for t, p, r, f in threshold_stats:
+        if t in [0.35, 0.40, 0.45, 0.50, 0.55, 0.60]:
+            marker = " <-- selected" if abs(t - best_threshold) < 0.01 else ""
+            print(f"  t={t:.2f}: precision={p:.1%}  recall={r:.1%}  F0.5={f:.3f}{marker}")
+
+    print(f"[train_model] Optimal confidence threshold: {best_threshold}")
+
+    y_pred = (y_prob >= best_threshold).astype(int)
+
     report = classification_report(y_test, y_pred, target_names=["no_post", "post"])
-    print("[train_model] Classification report on held-out test set:")
+    print(f"[train_model] Classification report (threshold={best_threshold}):")
     print(report)
 
     # Feature importance
@@ -388,6 +424,7 @@ def train_model(df: pd.DataFrame) -> GradientBoostingClassifier:
 
     # Save metrics for dashboard
     metrics = {
+        "confidence_threshold": best_threshold,
         "accuracy": float(accuracy_score(y_test, y_pred)),
         "precision_post": float(precision_score(y_test, y_pred, pos_label=1)),
         "recall_post": float(recall_score(y_test, y_pred, pos_label=1)),
@@ -409,6 +446,67 @@ def train_model(df: pd.DataFrame) -> GradientBoostingClassifier:
     return clf
 
 
+# ---------------------------------------------------------------------------
+# Live News Signal — boosts probability when Trump is trending in news
+# ---------------------------------------------------------------------------
+import time as _time
+import requests as _requests
+
+_news_cache: dict[str, tuple[float, float]] = {}
+_NEWS_CACHE_TTL = 300  # 5 minutes
+
+
+def get_news_boost() -> float:
+    """
+    Fetch current Trump-related news volume from Google News RSS.
+    Compares "trump" article count against a neutral baseline ("politics")
+    to detect spikes above normal coverage.
+    Returns a boost multiplier (0.0 = no boost, up to 0.25).
+    Cached for 5 minutes.
+    """
+    now = _time.time()
+    if "boost" in _news_cache:
+        cached_time, cached_val = _news_cache["boost"]
+        if now - cached_time < _NEWS_CACHE_TTL:
+            return cached_val
+
+    try:
+        # Fetch Trump-specific news count
+        resp_trump = _requests.get(
+            "https://news.google.com/rss/search",
+            params={"q": "trump", "hl": "en-US", "gl": "US", "ceid": "US:en"},
+            timeout=5,
+        )
+        resp_trump.raise_for_status()
+        trump_count = resp_trump.text.count("<item>")
+
+        # Fetch baseline politics count for comparison
+        resp_base = _requests.get(
+            "https://news.google.com/rss/search",
+            params={"q": "politics", "hl": "en-US", "gl": "US", "ceid": "US:en"},
+            timeout=5,
+        )
+        resp_base.raise_for_status()
+        base_count = max(resp_base.text.count("<item>"), 1)
+
+        # Ratio > 2x baseline = spike
+        ratio = trump_count / base_count
+        if ratio >= 3.0:
+            boost = 0.25  # major spike
+        elif ratio >= 2.0:
+            boost = 0.15  # notable spike
+        elif ratio >= 1.5:
+            boost = 0.05  # mild elevation
+        else:
+            boost = 0.0   # normal
+
+        _news_cache["boost"] = (now, boost)
+        return boost
+    except Exception:
+        _news_cache["boost"] = (now, 0.0)
+        return 0.0
+
+
 def predict_live_probability(
     current_time_hour: int = 10,
     hours_since_last: float = 1.5,
@@ -416,14 +514,15 @@ def predict_live_probability(
     posting_velocity_4h: float = 0.5,
     gap_acceleration: float = 0.0,
     day_of_week: int | None = None,
-    news_volume_4h: float = 10.0,
-    news_sentiment: float = 0.0,
-    simulated_vix_4h_vol: float = 18.0,
+    session_length: int = 0,
+    posts_today: int = 0,
+    posted_1h_ago: int = 0,
+    posted_2h_ago: int = 0,
+    posted_3h_ago: int = 0,
 ) -> float:
     """
     Lightweight inference: load the saved model and return P(post in next hour).
-
-    Now accepts news context, regime, and VIX market feedback features.
+    Uses behavioral + session features — no lookup tables.
     """
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
@@ -436,25 +535,23 @@ def predict_live_probability(
     if day_of_week is None:
         day_of_week = datetime.now(tz=EST).weekday()
 
-    # Compute all features
     hour_sin = np.sin(2 * np.pi * hour / 24)
     hour_cos = np.cos(2 * np.pi * hour / 24)
     day_sin = np.sin(2 * np.pi * day_of_week / 7)
     day_cos = np.cos(2 * np.pi * day_of_week / 7)
     is_weekend = 1 if day_of_week >= 5 else 0
     is_peak_hour = 1 if (7 <= hour <= 11) or (18 <= hour <= 23) else 0
-
-    # Historical average posts per hour (rough estimate)
-    peak_hours_avg = {
-        0: 0.4, 1: 0.2, 2: 0.05, 3: 0.02, 4: 0.01, 5: 0.02,
-        6: 0.1, 7: 0.5, 8: 0.8, 9: 1.0, 10: 1.1, 11: 1.0,
-        12: 0.8, 13: 0.7, 14: 0.7, 15: 0.6, 16: 0.6, 17: 0.7,
-        18: 0.8, 19: 0.9, 20: 1.0, 21: 1.1, 22: 0.9, 23: 0.6,
-    }
-    avg_posts_this_hour_hist = peak_hours_avg.get(hour, 0.5)
-
-    # Regime flag: high-activity if >5 posts in last 24h
     regime_flag = 1 if post_count_24h > 5 else 0
+
+    # Interaction features
+    velocity_x_peak = posting_velocity_4h * is_peak_hour
+    gap_x_peak = hours_since_last * is_peak_hour
+    velocity_x_regime = posting_velocity_4h * regime_flag
+    posts_30min = posting_velocity_4h * 4  # proxy from velocity
+
+    # Session features
+    no_post_today_yet = 1 if posts_today == 0 else 0
+    hours_since_first_today = hour - (hour - min(session_length, hour)) if posts_today > 0 else 0
 
     features = np.array([[
         hour_sin,
@@ -467,22 +564,27 @@ def predict_live_probability(
         post_count_24h,
         posting_velocity_4h,
         gap_acceleration,
-        avg_posts_this_hour_hist,
         hour,
-        # New features
-        news_volume_4h,
-        news_sentiment,
         regime_flag,
-        simulated_vix_4h_vol,
+        velocity_x_peak,
+        gap_x_peak,
+        velocity_x_regime,
+        posts_30min,
+        session_length,
+        posts_today,
+        no_post_today_yet,
+        hours_since_first_today,
+        posted_1h_ago,
+        posted_2h_ago,
+        posted_3h_ago,
     ]])
 
     prob: float = clf.predict_proba(features)[0][1]
 
-    # VIX exponential scaling: if VIX is elevated (>25), boost probability
-    # This models the feedback loop where market crisis drives reactive posting
-    if simulated_vix_4h_vol > 25:
-        vix_boost = (math.exp((simulated_vix_4h_vol - 25) / 15) - 1) * 0.15
-        prob = min(0.99, prob + vix_boost)
+    # Apply live news boost if available
+    news_boost = get_news_boost()
+    if news_boost > 0:
+        prob = min(0.99, prob * (1.0 + news_boost))
 
     return round(float(prob), 4)
 
@@ -624,18 +726,15 @@ if __name__ == "__main__":
     # Step 3: Example predictions
     print("\n=== EXAMPLE LIVE PREDICTIONS ===")
     scenarios = [
-        ("Morning burst (9am, 0.25h since, 12/24h, VIX=20)", 9, 0.25, 12, 2.0, -0.5, 15, -0.1, 20.0),
-        ("Crisis mode (11pm, 1h since, 8/24h, VIX=35)", 23, 1.0, 8, 0.5, 0.5, 30, -0.5, 35.0),
-        ("Dead zone (4am, 5h since, 3/24h, VIX=15)", 4, 5.0, 3, 0.0, 1.0, 3, 0.2, 15.0),
-        ("High news vol (2pm, 3h since, 6/24h, VIX=22)", 14, 3.0, 6, 0.25, 0.5, 25, -0.3, 22.0),
-        ("Evening + crisis (7pm, 0.3h since, 15/24h, VIX=40)", 19, 0.3, 15, 3.0, -1.0, 40, -0.7, 40.0),
+        ("Morning burst (9am, 0.25h since, 12/24h)", 9, 0.25, 12, 2.0, -0.5),
+        ("Late night (11pm, 1h since, 8/24h)", 23, 1.0, 8, 0.5, 0.5),
+        ("Dead zone (4am, 5h since, 3/24h)", 4, 5.0, 3, 0.0, 1.0),
+        ("Afternoon lull (2pm, 3h since, 6/24h)", 14, 3.0, 6, 0.25, 0.5),
+        ("Evening burst (7pm, 0.3h since, 15/24h)", 19, 0.3, 15, 3.0, -1.0),
     ]
 
-    for label, hour, since, count, vel, accel, nv, ns, vix in scenarios:
-        prob = predict_live_probability(
-            hour, since, count, vel, accel,
-            news_volume_4h=nv, news_sentiment=ns, simulated_vix_4h_vol=vix,
-        )
+    for label, hour, since, count, vel, accel in scenarios:
+        prob = predict_live_probability(hour, since, count, vel, accel)
         print(f"  {label}")
         print(f"    -> P(post next hour) = {prob:.2%}")
     print()

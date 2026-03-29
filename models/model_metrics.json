@@ -1,38 +1,46 @@
 {
-  "accuracy": 0.6325459317585301,
-  "precision_post": 0.3319956220357534,
-  "recall_post": 0.6237148732008225,
-  "f1_post": 0.43333333333333335,
+  "confidence_threshold": 0.37,
+  "accuracy": 0.5613710050949514,
+  "precision_post": 0.3261226725082147,
+  "recall_post": 0.7581158497772119,
+  "f1_post": 0.45605973578403214,
   "confusion_matrix": [
     [
-      3187,
-      1831
+      2445,
+      2461
     ],
     [
-      549,
-      910
+      380,
+      1191
     ]
   ],
   "feature_importances": {
-    "hour_sin": 0.0217,
-    "hour_cos": 0.0377,
-    "day_sin": 0.0221,
-    "day_cos": 0.0161,
-    "is_weekend": 0.0037,
-    "is_peak_hour": 0.0055,
-    "hours_since_last_post": 0.1204,
-    "rolling_post_count_24h": 0.0779,
-    "posting_velocity_4h": 0.033,
-    "gap_acceleration": 0.0175,
-    "avg_posts_this_hour_hist": 0.041,
-    "hour_of_day": 0.2761,
-    "news_volume_4h": 0.0655,
-    "news_sentiment": 0.1366,
-    "regime_flag": 0.0016,
-    "simulated_vix_4h_vol": 0.1238
+    "hour_sin": 0.0338,
+    "hour_cos": 0.0511,
+    "day_sin": 0.0373,
+    "day_cos": 0.0238,
+    "is_weekend": 0.0029,
+    "is_peak_hour": 0.0023,
+    "hours_since_last_post": 0.1299,
+    "rolling_post_count_24h": 0.1252,
+    "posting_velocity_4h": 0.0177,
+    "gap_acceleration": 0.0192,
+    "hour_of_day": 0.3383,
+    "regime_flag": 0.0015,
+    "velocity_x_peak": 0.0235,
+    "gap_x_peak": 0.0258,
+    "velocity_x_regime": 0.0235,
+    "posts_30min": 0.0194,
+    "session_length": 0.0118,
+    "posts_today": 0.0571,
+    "no_post_today_yet": 0.0004,
+    "hours_since_first_today": 0.0452,
+    "posted_1h_ago": 0.0008,
+    "posted_2h_ago": 0.0037,
+    "posted_3h_ago": 0.0059
   },
   "n_train": 25906,
   "n_test": 6477,
   "positive_rate": 0.22524163913164313,
-  "classification_report": "              precision    recall  f1-score   support\n\n     no_post       0.85      0.64      0.73      5018\n        post       0.33      0.62      0.43      1459\n\n    accuracy                           0.63      6477\n   macro avg       0.59      0.63      0.58      6477\nweighted avg       0.74      0.63      0.66      6477\n"
+  "classification_report": "              precision    recall  f1-score   support\n\n     no_post       0.87      0.50      0.63      4906\n        post       0.33      0.76      0.46      1571\n\n    accuracy                           0.56      6477\n   macro avg       0.60      0.63      0.54      6477\nweighted avg       0.73      0.56      0.59      6477\n"
 }

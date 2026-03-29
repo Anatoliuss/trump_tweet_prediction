@@ -182,37 +182,38 @@ def run_agent_cycle(
     sector_filter: str | None = None,
     posting_velocity_4h: float = 0.5,
     gap_acceleration: float = 0.0,
-    news_volume_4h: float = 10.0,
-    news_sentiment: float = 0.0,
-    simulated_vix_4h_vol: float = 18.0,
+    session_length: int = 0,
+    posts_today: int = 0,
+    posted_1h_ago: int = 0,
+    posted_2h_ago: int = 0,
+    posted_3h_ago: int = 0,
 ) -> dict:
     """
     Execute one full agent decision cycle:
       1. Predict P(post in next hour) via the ML model
       2. If above threshold, predict topic via LLM
       3. Search for actionable prediction market contracts
-      4. Evaluate arbitrage (Alpha Delta) against Polymarket
+      4. Evaluate signal strength
       5. Get market impact analysis
-      6. Signal is HOT only if alpha_delta >= +3%
 
-    Returns dict with all results including arbitrage evaluation.
+    Returns dict with all results.
     """
     from ml_engine import predict_live_probability, predict_next_topic
     from market_impact import get_impact_for_topic, simulate_market_reaction
 
-    # Compute regime from post_count_24h
     regime_label = "HIGH-ACTIVITY" if post_count_24h > 5 else "DORMANT"
 
-    # Step 1: ML probability (with new features)
     probability = predict_live_probability(
         current_time_hour=current_time_hour,
         hours_since_last=hours_since_last,
         post_count_24h=post_count_24h,
         posting_velocity_4h=posting_velocity_4h,
         gap_acceleration=gap_acceleration,
-        news_volume_4h=news_volume_4h,
-        news_sentiment=news_sentiment,
-        simulated_vix_4h_vol=simulated_vix_4h_vol,
+        session_length=session_length,
+        posts_today=posts_today,
+        posted_1h_ago=posted_1h_ago,
+        posted_2h_ago=posted_2h_ago,
+        posted_3h_ago=posted_3h_ago,
     )
 
     # Step 2: topic prediction (only if base probability is above threshold)
@@ -267,9 +268,6 @@ def run_agent_cycle(
         "post_count_24h": post_count_24h,
         "arbitrage": signal_eval,
         "regime": regime_label,
-        "news_volume_4h": news_volume_4h,
-        "news_sentiment": news_sentiment,
-        "simulated_vix_4h_vol": simulated_vix_4h_vol,
     }
 
 

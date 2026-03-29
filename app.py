@@ -78,9 +78,11 @@ def _compute_live_state() -> dict:
             "hours_since": 2.0,
             "post_count_24h": 5,
             "posting_velocity": 0.5,
-            "news_volume": 10,
-            "news_sentiment": 0.0,
-            "vix_level": 18.0,
+            "session_length": 0,
+            "posts_today": 0,
+            "posted_1h_ago": 0,
+            "posted_2h_ago": 0,
+            "posted_3h_ago": 0,
         }
 
     # Current hour
@@ -105,31 +107,19 @@ def _compute_live_state() -> dict:
     velocity = round(velocity * 4) / 4  # snap to 0.25 step
     velocity = min(5.0, velocity)
 
-    # Simulated news/VIX based on current activity level and time
-    # More active = more newsworthy = higher volume
-    rng = random.Random(now_est.hour * 100 + now_est.minute)
-    is_business_hours = 9 <= current_hour <= 17
+    # Session features
+    today_start = now_est.replace(hour=0, minute=0, second=0, microsecond=0)
+    posts_today_count = int((df["_ts_est"] >= today_start).sum())
 
-    news_vol = rng.randint(5, 12)
-    if is_business_hours:
-        news_vol += rng.randint(3, 8)
-    if posts_24h > 10:
-        news_vol += rng.randint(5, 10)  # high activity = high news
-    news_vol = min(50, news_vol)
-
-    # Sentiment: slightly negative when posting is heavy
-    sentiment = round(rng.gauss(0.05, 0.2), 2)
-    if posts_24h > 15:
-        sentiment -= 0.2
-    sentiment = round(max(-1.0, min(1.0, sentiment)) * 20) / 20  # snap to 0.05 step
-
-    # VIX: baseline 18, elevated if high activity
-    vix = round(rng.gauss(18.0, 2.0), 1)
-    if posts_24h > 10:
-        vix += (posts_24h - 10) * 0.5
-    if hours_since_last < 0.5:
-        vix += 2.0  # very recent post = possible market event
-    vix = round(max(10.0, min(50.0, vix)) * 2) / 2  # snap to 0.5 step
+    # Session length: count consecutive recent hours with posts
+    sess_len = 0
+    for h_back in range(1, 13):
+        h_start = now_est - timedelta(hours=h_back)
+        h_end = now_est - timedelta(hours=h_back - 1)
+        if ((df["_ts_est"] >= h_start) & (df["_ts_est"] < h_end)).any():
+            sess_len += 1
+        else:
+            break
 
     # Recent tweets for the feed
     recent_texts = []
@@ -138,14 +128,24 @@ def _compute_live_state() -> dict:
         real_posts = df[~df["_text"].str.startswith("RT @", na=False)]
         recent_texts = real_posts["_text"].tail(5).tolist()
 
+    # Lagged binary flags: did they post 1/2/3 hours ago?
+    posted_flags = []
+    for h_back in [1, 2, 3]:
+        h_start = now_est - timedelta(hours=h_back)
+        h_end = now_est - timedelta(hours=h_back - 1)
+        had_post = int(((df["_ts_est"] >= h_start) & (df["_ts_est"] < h_end)).any())
+        posted_flags.append(had_post)
+
     return {
         "sim_hour": current_hour,
         "hours_since": hours_since_last,
         "post_count_24h": posts_24h,
         "posting_velocity": velocity,
-        "news_volume": news_vol,
-        "news_sentiment": sentiment,
-        "vix_level": vix,
+        "session_length": sess_len,
+        "posts_today": posts_today_count,
+        "posted_1h_ago": posted_flags[0],
+        "posted_2h_ago": posted_flags[1],
+        "posted_3h_ago": posted_flags[2],
         "recent_tweets": recent_texts,
     }
 
@@ -157,9 +157,11 @@ def _on_auto_sync():
     st.session_state["k_hours_since"] = state["hours_since"]
     st.session_state["k_post_count_24h"] = state["post_count_24h"]
     st.session_state["k_posting_velocity"] = state["posting_velocity"]
-    st.session_state["k_news_volume"] = state["news_volume"]
-    st.session_state["k_news_sentiment"] = state["news_sentiment"]
-    st.session_state["k_vix_level"] = state["vix_level"]
+    st.session_state["k_session_length"] = state["session_length"]
+    st.session_state["k_posts_today"] = state["posts_today"]
+    st.session_state["k_posted_1h_ago"] = state["posted_1h_ago"]
+    st.session_state["k_posted_2h_ago"] = state["posted_2h_ago"]
+    st.session_state["k_posted_3h_ago"] = state["posted_3h_ago"]
     if state.get("recent_tweets"):
         st.session_state["k_tweets_text"] = "\n".join(state["recent_tweets"])
     st.session_state["auto_synced"] = True
@@ -701,22 +703,22 @@ posting_velocity = st.sidebar.slider(
     key="k_posting_velocity",
 )
 
-st.sidebar.markdown('<div class="sidebar-section">Market Context</div>', unsafe_allow_html=True)
-news_volume = st.sidebar.slider(
-    "NEWS VOLUME (4H)", min_value=0, max_value=50, value=10,
-    key="k_news_volume",
-    help="Breaking news article count in last 4 hours"
+st.sidebar.markdown('<div class="sidebar-section">Session</div>', unsafe_allow_html=True)
+session_length = st.sidebar.slider(
+    "BURST LENGTH (CONSEC. HRS)", min_value=0, max_value=12, value=0,
+    key="k_session_length",
+    help="Consecutive hours with posts (current burst)"
 )
-news_sentiment = st.sidebar.slider(
-    "NEWS SENTIMENT", min_value=-1.0, max_value=1.0, value=0.0, step=0.05,
-    key="k_news_sentiment",
-    help="Aggregate news sentiment (-1=bearish, +1=bullish)"
+posts_today = st.sidebar.slider(
+    "POSTS TODAY", min_value=0, max_value=30, value=0,
+    key="k_posts_today",
+    help="Total posts so far today"
 )
-vix_level = st.sidebar.slider(
-    "VIX (4H TRAILING)", min_value=10.0, max_value=50.0, value=18.0, step=0.5,
-    key="k_vix_level",
-    help="Simulated CBOE Volatility Index"
-)
+
+# Derive lag flags from session length (auto-synced or from burst slider)
+posted_1h_ago = st.session_state.get("k_posted_1h_ago", 1 if session_length >= 1 else 0)
+posted_2h_ago = st.session_state.get("k_posted_2h_ago", 1 if session_length >= 2 else 0)
+posted_3h_ago = st.session_state.get("k_posted_3h_ago", 1 if session_length >= 3 else 0)
 
 st.sidebar.markdown('<div class="sidebar-section">Market Filter</div>', unsafe_allow_html=True)
 sector_options = ["All"] + list(SECTORS.keys())
@@ -754,9 +756,11 @@ result = run_agent_cycle(
     use_llm=use_llm,
     sector_filter=selected_sector if selected_sector != "All" else None,
     posting_velocity_4h=posting_velocity,
-    news_volume_4h=float(news_volume),
-    news_sentiment=news_sentiment,
-    simulated_vix_4h_vol=vix_level,
+    session_length=session_length,
+    posts_today=posts_today,
+    posted_1h_ago=posted_1h_ago,
+    posted_2h_ago=posted_2h_ago,
+    posted_3h_ago=posted_3h_ago,
 )
 
 prob = result["probability"]
@@ -804,29 +808,19 @@ with tab1:
             unsafe_allow_html=True,
         )
 
-        # VIX indicator
-        vix_color = "#ef6b6b" if vix_level > 30 else "#edc04a" if vix_level > 22 else "#5cd8a0"
+        # Posting velocity
         st.markdown(
             f"<div class='data-card'>"
-            f"<div class='data-card-value'><span class='mono' style='color:{vix_color}'>{vix_level:.1f}</span></div>"
-            f"<div class='data-card-label'>VIX (4H Trailing)</div></div>",
+            f"<div class='data-card-value'><span class='mono'>{posting_velocity:.2f}</span></div>"
+            f"<div class='data-card-label'>Velocity (posts/hr)</div></div>",
             unsafe_allow_html=True,
         )
 
-        # News sentiment
-        sent_color = "#5cd8a0" if news_sentiment > 0.2 else "#ef6b6b" if news_sentiment < -0.2 else "#edc04a"
+        # Posts in 24h
         st.markdown(
             f"<div class='data-card' style='margin-top:0.5rem;'>"
-            f"<div class='data-card-value'><span class='mono' style='color:{sent_color}'>{news_sentiment:+.2f}</span></div>"
-            f"<div class='data-card-label'>News Sentiment</div></div>",
-            unsafe_allow_html=True,
-        )
-
-        # News volume
-        st.markdown(
-            f"<div class='data-card' style='margin-top:0.5rem;'>"
-            f"<div class='data-card-value'><span class='mono'>{news_volume}</span></div>"
-            f"<div class='data-card-label'>News Volume (4H)</div></div>",
+            f"<div class='data-card-value'><span class='mono'>{post_count_24h}</span></div>"
+            f"<div class='data-card-label'>Posts (24H)</div></div>",
             unsafe_allow_html=True,
         )
 
