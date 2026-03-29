@@ -1,34 +1,38 @@
 {
-  "accuracy": 0.6217384591631928,
-  "precision_post": 0.3348883705431523,
-  "recall_post": 0.6888279643591501,
-  "f1_post": 0.45067264573991034,
+  "accuracy": 0.6325459317585301,
+  "precision_post": 0.3319956220357534,
+  "recall_post": 0.6237148732008225,
+  "f1_post": 0.43333333333333335,
   "confusion_matrix": [
     [
-      3022,
-      1996
+      3187,
+      1831
     ],
     [
-      454,
-      1005
+      549,
+      910
     ]
   ],
   "feature_importances": {
-    "hour_sin": 0.0312,
-    "hour_cos": 0.0458,
-    "day_sin": 0.0412,
-    "day_cos": 0.0311,
-    "is_weekend": 0.0055,
-    "is_peak_hour": 0.006,
-    "hours_since_last_post": 0.1701,
-    "rolling_post_count_24h": 0.1576,
-    "posting_velocity_4h": 0.0672,
-    "gap_acceleration": 0.0453,
-    "avg_posts_this_hour_hist": 0.0553,
-    "hour_of_day": 0.3437
+    "hour_sin": 0.0217,
+    "hour_cos": 0.0377,
+    "day_sin": 0.0221,
+    "day_cos": 0.0161,
+    "is_weekend": 0.0037,
+    "is_peak_hour": 0.0055,
+    "hours_since_last_post": 0.1204,
+    "rolling_post_count_24h": 0.0779,
+    "posting_velocity_4h": 0.033,
+    "gap_acceleration": 0.0175,
+    "avg_posts_this_hour_hist": 0.041,
+    "hour_of_day": 0.2761,
+    "news_volume_4h": 0.0655,
+    "news_sentiment": 0.1366,
+    "regime_flag": 0.0016,
+    "simulated_vix_4h_vol": 0.1238
   },
   "n_train": 25906,
   "n_test": 6477,
   "positive_rate": 0.22524163913164313,
-  "classification_report": "              precision    recall  f1-score   support\n\n     no_post       0.87      0.60      0.71      5018\n        post       0.33      0.69      0.45      1459\n\n    accuracy                           0.62      6477\n   macro avg       0.60      0.65      0.58      6477\nweighted avg       0.75      0.62      0.65      6477\n"
+  "classification_report": "              precision    recall  f1-score   support\n\n     no_post       0.85      0.64      0.73      5018\n        post       0.33      0.62      0.43      1459\n\n    accuracy                           0.63      6477\n   macro avg       0.59      0.63      0.58      6477\nweighted avg       0.74      0.63      0.66      6477\n"
 }

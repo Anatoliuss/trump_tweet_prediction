@@ -1,7 +1,8 @@
 """
-ml_engine.py — MentionBot Predictive Engine v2
+ml_engine.py — MentionBot Predictive Engine v3
 ================================================
-Enhanced with 12+ features, GradientBoosting, and model metrics.
+Enhanced with 16 features including news context, regime detection,
+and market feedback loops (VIX/DXY).
 
 Public API:
   - ingest_real_data(csv_path)                    -> pd.DataFrame
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -48,6 +50,7 @@ MODEL_PATH = MODELS_DIR / "mentionbot_rf.joblib"
 METRICS_PATH = MODELS_DIR / "model_metrics.json"
 
 FEATURE_COLS = [
+    # Original 12 autoregressive features
     "hour_sin",
     "hour_cos",
     "day_sin",
@@ -60,6 +63,13 @@ FEATURE_COLS = [
     "gap_acceleration",
     "avg_posts_this_hour_hist",
     "hour_of_day",
+    # NEW: News context features
+    "news_volume_4h",
+    "news_sentiment",
+    # NEW: Regime classification
+    "regime_flag",
+    # NEW: Market feedback loops
+    "simulated_vix_4h_vol",
 ]
 
 TOPIC_LABELS = ["Tariffs", "Crypto", "Media", "Borders", "Fed", "Cabinet", "Other"]
@@ -124,7 +134,14 @@ def ingest_real_data(csv_path: str) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"])
 
-    df = df[["timestamp", "text"]].sort_values("timestamp").reset_index(drop=True)
+    # Keep extra columns if they exist (news_volume_4h, etc.)
+    keep_cols = ["timestamp", "text"]
+    extra_cols = ["news_volume_4h", "news_sentiment", "simulated_vix_4h_vol", "simulated_dxy_4h_vol"]
+    for col in extra_cols:
+        if col in df.columns:
+            keep_cols.append(col)
+
+    df = df[keep_cols].sort_values("timestamp").reset_index(drop=True)
 
     print(
         f"[ingest] {original_count} raw rows -> {len(df)} clean original posts "
@@ -136,7 +153,8 @@ def ingest_real_data(csv_path: str) -> pd.DataFrame:
 
 def prep_data(csv_path: str, pre_ingested_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
-    Load historical posts and return an hourly feature matrix with 12 features.
+    Load historical posts and return an hourly feature matrix with 16 features.
+    Includes news context, regime detection, and market feedback features.
     """
     # ------------------------------------------------------------------
     # 1. Load & parse timestamps
@@ -242,8 +260,6 @@ def prep_data(csv_path: str, pre_ingested_df: pd.DataFrame | None = None) -> pd.
 
     # ------------------------------------------------------------------
     # 11. gap_acceleration — change in hours_since_last_post
-    #     Positive = gaps getting larger (slowing down)
-    #     Negative = gaps getting smaller (speeding up)
     # ------------------------------------------------------------------
     hourly["gap_acceleration"] = (
         hourly["hours_since_last_post"].diff().fillna(0)
@@ -255,12 +271,69 @@ def prep_data(csv_path: str, pre_ingested_df: pd.DataFrame | None = None) -> pd.
     hour_means = hourly.groupby("hour_of_day")["post_count"].transform("mean")
     hourly["avg_posts_this_hour_hist"] = hour_means
 
+    # ==================================================================
+    # NEW FEATURES
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # 13-14. News context: news_volume_4h, news_sentiment
+    # Aggregate per-post news data into hourly buckets, forward-fill gaps
+    # ------------------------------------------------------------------
+    has_news_data = "news_volume_4h" in df_raw.columns and "news_sentiment" in df_raw.columns
+    if has_news_data:
+        news_hourly = df_raw.groupby("hour_bucket").agg(
+            news_volume_4h=("news_volume_4h", "max"),
+            news_sentiment=("news_sentiment", "mean"),
+        )
+        hourly = hourly.join(news_hourly)
+        hourly["news_volume_4h"] = hourly["news_volume_4h"].ffill().fillna(8).astype(float)
+        hourly["news_sentiment"] = hourly["news_sentiment"].ffill().fillna(0.0)
+    else:
+        # Generate synthetic news features if not in source data
+        rng = np.random.RandomState(42)
+        n = len(hourly)
+        hourly["news_volume_4h"] = np.clip(
+            rng.normal(10, 5, n) + hourly["post_count"] * 2, 0, 50
+        ).round(0)
+        hourly["news_sentiment"] = np.clip(
+            rng.normal(0.05, 0.3, n) - (hourly["news_volume_4h"] - 10) * 0.01,
+            -1.0, 1.0,
+        ).round(3)
+
+    # ------------------------------------------------------------------
+    # 15. Regime classification (rule-based heuristic)
+    #     High-Activity Regime (1): rolling 24h posts > 5
+    #     Dormant Regime (0): otherwise
+    # ------------------------------------------------------------------
+    hourly["regime_flag"] = (hourly["rolling_post_count_24h"] > 5).astype(int)
+
+    # ------------------------------------------------------------------
+    # 16. Market feedback: simulated_vix_4h_vol
+    #     VIX trailing volatility — high VIX = crisis mode = more posts
+    # ------------------------------------------------------------------
+    has_vix_data = "simulated_vix_4h_vol" in df_raw.columns
+    if has_vix_data:
+        vix_hourly = df_raw.groupby("hour_bucket").agg(
+            simulated_vix_4h_vol=("simulated_vix_4h_vol", "mean"),
+        )
+        hourly = hourly.join(vix_hourly)
+        hourly["simulated_vix_4h_vol"] = hourly["simulated_vix_4h_vol"].ffill().fillna(18.0)
+    else:
+        # Generate synthetic VIX correlated with posting activity
+        rng = np.random.RandomState(99)
+        n = len(hourly)
+        vix_base = rng.normal(18, 3, n)
+        # Higher post velocity -> higher VIX (market turmoil drives posts)
+        vix_base += hourly["posting_velocity_4h"].values * 2
+        hourly["simulated_vix_4h_vol"] = np.clip(vix_base, 10, 50).round(2)
+
     # Drop the last row (target shifted off the end)
     hourly = hourly.iloc[:-1].copy()
 
     print(
         f"[prep_data] {len(hourly)} hourly rows | "
-        f"positive rate: {hourly['posted_in_next_hour'].mean():.1%}"
+        f"positive rate: {hourly['posted_in_next_hour'].mean():.1%} | "
+        f"features: {len(FEATURE_COLS)}"
     )
     return hourly
 
@@ -271,7 +344,7 @@ def prep_data(csv_path: str, pre_ingested_df: pd.DataFrame | None = None) -> pd.
 
 def train_model(df: pd.DataFrame) -> GradientBoostingClassifier:
     """
-    Train a GradientBoostingClassifier on the enhanced feature matrix.
+    Train a GradientBoostingClassifier on the enhanced 16-feature matrix.
     Saves model + metrics to models/ directory.
     """
     MODELS_DIR.mkdir(exist_ok=True)
@@ -284,7 +357,6 @@ def train_model(df: pd.DataFrame) -> GradientBoostingClassifier:
     )
 
     # Compute sample weights to handle class imbalance
-    # Posts are ~22% of data, so upweight them ~3x
     sample_weights = np.where(y_train == 1, 3.0, 1.0)
 
     clf = GradientBoostingClassifier(
@@ -344,11 +416,14 @@ def predict_live_probability(
     posting_velocity_4h: float = 0.5,
     gap_acceleration: float = 0.0,
     day_of_week: int | None = None,
+    news_volume_4h: float = 10.0,
+    news_sentiment: float = 0.0,
+    simulated_vix_4h_vol: float = 18.0,
 ) -> float:
     """
     Lightweight inference: load the saved model and return P(post in next hour).
 
-    Accepts simple numeric inputs (no datetime objects needed for dashboard use).
+    Now accepts news context, regime, and VIX market feedback features.
     """
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
@@ -369,8 +444,7 @@ def predict_live_probability(
     is_weekend = 1 if day_of_week >= 5 else 0
     is_peak_hour = 1 if (7 <= hour <= 11) or (18 <= hour <= 23) else 0
 
-    # Historical average posts per hour (rough estimate if not available)
-    # Based on data: ~0.55 posts/hour overall, peaks at ~1.2
+    # Historical average posts per hour (rough estimate)
     peak_hours_avg = {
         0: 0.4, 1: 0.2, 2: 0.05, 3: 0.02, 4: 0.01, 5: 0.02,
         6: 0.1, 7: 0.5, 8: 0.8, 9: 1.0, 10: 1.1, 11: 1.0,
@@ -378,6 +452,9 @@ def predict_live_probability(
         18: 0.8, 19: 0.9, 20: 1.0, 21: 1.1, 22: 0.9, 23: 0.6,
     }
     avg_posts_this_hour_hist = peak_hours_avg.get(hour, 0.5)
+
+    # Regime flag: high-activity if >5 posts in last 24h
+    regime_flag = 1 if post_count_24h > 5 else 0
 
     features = np.array([[
         hour_sin,
@@ -392,9 +469,21 @@ def predict_live_probability(
         gap_acceleration,
         avg_posts_this_hour_hist,
         hour,
+        # New features
+        news_volume_4h,
+        news_sentiment,
+        regime_flag,
+        simulated_vix_4h_vol,
     ]])
 
     prob: float = clf.predict_proba(features)[0][1]
+
+    # VIX exponential scaling: if VIX is elevated (>25), boost probability
+    # This models the feedback loop where market crisis drives reactive posting
+    if simulated_vix_4h_vol > 25:
+        vix_boost = (math.exp((simulated_vix_4h_vol - 25) / 15) - 1) * 0.15
+        prob = min(0.99, prob + vix_boost)
+
     return round(float(prob), 4)
 
 
@@ -470,8 +559,8 @@ def get_model_metrics() -> dict:
 
 def get_hourly_heatmap_data(csv_path: str = None, pre_ingested_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
-    Build hour-of-day × day-of-week heatmap of posting frequency.
-    Returns a 24×7 DataFrame (index=hour 0-23, columns=day 0-6).
+    Build hour-of-day x day-of-week heatmap of posting frequency.
+    Returns a 24x7 DataFrame (index=hour 0-23, columns=day 0-6).
     """
     if pre_ingested_df is not None:
         df = pre_ingested_df.copy()
@@ -529,6 +618,7 @@ if __name__ == "__main__":
     print(f"  Real posts used:   {len(clean_df) if clean_df is not None else 'N/A (synthetic)'}")
     print(f"  Hourly rows:       {len(df)}")
     print(f"  Positive rate:     {df['posted_in_next_hour'].mean():.1%}")
+    print(f"  Features:          {len(FEATURE_COLS)}")
     print()
 
     # Step 2: Train
@@ -537,15 +627,18 @@ if __name__ == "__main__":
     # Step 3: Example predictions
     print("\n=== EXAMPLE LIVE PREDICTIONS ===")
     scenarios = [
-        ("Morning burst (9am, 0.25h since, 12 posts/24h)", 9, 0.25, 12, 2.0, -0.5),
-        ("Late night (11pm, 1h since, 8 posts/24h)", 23, 1.0, 8, 0.5, 0.5),
-        ("Dead zone (4am, 5h since, 3 posts/24h)", 4, 5.0, 3, 0.0, 1.0),
-        ("Afternoon quiet (2pm, 3h since, 6 posts/24h)", 14, 3.0, 6, 0.25, 0.5),
-        ("Evening peak (7pm, 0.3h since, 15 posts/24h)", 19, 0.3, 15, 3.0, -1.0),
+        ("Morning burst (9am, 0.25h since, 12/24h, VIX=20)", 9, 0.25, 12, 2.0, -0.5, 15, -0.1, 20.0),
+        ("Crisis mode (11pm, 1h since, 8/24h, VIX=35)", 23, 1.0, 8, 0.5, 0.5, 30, -0.5, 35.0),
+        ("Dead zone (4am, 5h since, 3/24h, VIX=15)", 4, 5.0, 3, 0.0, 1.0, 3, 0.2, 15.0),
+        ("High news vol (2pm, 3h since, 6/24h, VIX=22)", 14, 3.0, 6, 0.25, 0.5, 25, -0.3, 22.0),
+        ("Evening + crisis (7pm, 0.3h since, 15/24h, VIX=40)", 19, 0.3, 15, 3.0, -1.0, 40, -0.7, 40.0),
     ]
 
-    for label, hour, since, count, vel, accel in scenarios:
-        prob = predict_live_probability(hour, since, count, vel, accel)
+    for label, hour, since, count, vel, accel, nv, ns, vix in scenarios:
+        prob = predict_live_probability(
+            hour, since, count, vel, accel,
+            news_volume_4h=nv, news_sentiment=ns, simulated_vix_4h_vol=vix,
+        )
         print(f"  {label}")
         print(f"    -> P(post next hour) = {prob:.2%}")
     print()

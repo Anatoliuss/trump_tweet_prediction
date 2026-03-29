@@ -1,7 +1,8 @@
 """
-app.py — MentionBot Quantitative Dashboard
-============================================
-Professional trading terminal interface.
+app.py — MentionBot Quantitative Dashboard v3
+===============================================
+Professional trading terminal interface with Alpha Delta arbitrage,
+regime detection, VIX/DXY feedback, and news context.
 
 Launch:  python -m streamlit run app.py
 """
@@ -180,10 +181,39 @@ st.markdown("""
         color: #F85149;
         border: 1px solid rgba(248, 81, 73, 0.3);
     }
+    .signal-warm {
+        background: rgba(210, 153, 34, 0.15);
+        color: #D29922;
+        border: 1px solid rgba(210, 153, 34, 0.3);
+    }
     .signal-cold {
         background: rgba(63, 185, 80, 0.15);
         color: #3FB950;
         border: 1px solid rgba(63, 185, 80, 0.3);
+    }
+
+    /* ===== ALPHA DELTA DISPLAY ===== */
+    .alpha-container {
+        text-align: center;
+        padding: 0.8rem 0;
+        margin-top: 0.5rem;
+    }
+    .alpha-value {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 1.8rem;
+        font-weight: 700;
+        line-height: 1;
+    }
+    .alpha-positive { color: #3FB950; }
+    .alpha-negative { color: #F85149; }
+    .alpha-neutral { color: #D29922; }
+    .alpha-label {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.6rem;
+        text-transform: uppercase;
+        letter-spacing: 0.15em;
+        color: #484F58;
+        margin-top: 0.3rem;
     }
 
     /* ===== DATA CARDS ===== */
@@ -261,6 +291,26 @@ st.markdown("""
         letter-spacing: 0.05em;
         margin-left: 0.5rem;
     }
+    .order-alpha {
+        font-family: 'JetBrains Mono', monospace;
+        display: inline-block;
+        padding: 0.1rem 0.5rem;
+        border-radius: 2px;
+        font-size: 0.65rem;
+        font-weight: 600;
+        letter-spacing: 0.05em;
+        margin-left: 0.5rem;
+    }
+    .order-alpha-pos {
+        background: rgba(63, 185, 80, 0.15);
+        color: #3FB950;
+        border: 1px solid rgba(63, 185, 80, 0.3);
+    }
+    .order-alpha-neg {
+        background: rgba(248, 81, 73, 0.1);
+        color: #F85149;
+        border: 1px solid rgba(248, 81, 73, 0.2);
+    }
 
     /* ===== TRADE BUTTONS ===== */
     .stButton > button {
@@ -320,6 +370,28 @@ st.markdown("""
         font-size: 0.8rem;
         letter-spacing: 0.06em;
         text-transform: uppercase;
+    }
+
+    /* ===== REGIME TAG ===== */
+    .regime-tag {
+        font-family: 'JetBrains Mono', monospace;
+        display: inline-block;
+        padding: 0.2rem 0.6rem;
+        border-radius: 2px;
+        font-weight: 600;
+        font-size: 0.65rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+    .regime-high {
+        background: rgba(248, 81, 73, 0.12);
+        color: #F85149;
+        border: 1px solid rgba(248, 81, 73, 0.25);
+    }
+    .regime-dormant {
+        background: rgba(63, 185, 80, 0.12);
+        color: #3FB950;
+        border: 1px solid rgba(63, 185, 80, 0.25);
     }
 
     /* ===== SECTION HEADERS ===== */
@@ -471,6 +543,20 @@ posting_velocity = st.sidebar.slider(
     "VELOCITY (POSTS/HR, 4H AVG)", min_value=0.0, max_value=5.0, value=0.5, step=0.25,
 )
 
+st.sidebar.markdown('<div class="sidebar-section">Market Context</div>', unsafe_allow_html=True)
+news_volume = st.sidebar.slider(
+    "NEWS VOLUME (4H)", min_value=0, max_value=50, value=10,
+    help="Breaking news article count in last 4 hours"
+)
+news_sentiment = st.sidebar.slider(
+    "NEWS SENTIMENT", min_value=-1.0, max_value=1.0, value=0.0, step=0.05,
+    help="Aggregate news sentiment (-1=bearish, +1=bullish)"
+)
+vix_level = st.sidebar.slider(
+    "VIX (4H TRAILING)", min_value=10.0, max_value=50.0, value=18.0, step=0.5,
+    help="Simulated CBOE Volatility Index"
+)
+
 st.sidebar.markdown('<div class="sidebar-section">Market Filter</div>', unsafe_allow_html=True)
 sector_options = ["All"] + list(SECTORS.keys())
 selected_sector = st.sidebar.selectbox("SECTOR", sector_options, index=0)
@@ -506,6 +592,9 @@ result = run_agent_cycle(
     use_llm=use_llm,
     sector_filter=selected_sector if selected_sector != "All" else None,
     posting_velocity_4h=posting_velocity,
+    news_volume_4h=float(news_volume),
+    news_sentiment=news_sentiment,
+    simulated_vix_4h_vol=vix_level,
 )
 
 prob = result["probability"]
@@ -513,6 +602,8 @@ signal = result["signal"]
 topic = result["predicted_topic"]
 contracts = result["contracts"]
 market_impacts = result.get("market_impacts", [])
+arbitrage = result.get("arbitrage", {})
+regime = result.get("regime", "DORMANT")
 
 # ---------------------------------------------------------------------------
 # Header
@@ -525,7 +616,7 @@ st.markdown(
 )
 st.markdown(
     '<div class="terminal-subtitle">'
-    'Real-time posting probability engine &mdash; prediction market order routing'
+    'Real-time posting probability engine &mdash; prediction market order routing &mdash; alpha arbitrage'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -540,6 +631,43 @@ tab1, tab2, tab3, tab4 = st.tabs(["LIVE RADAR", "TIME TRAVEL", "MARKET IMPACT", 
 # ===================================================================
 with tab1:
     col_left, col_center, col_right = st.columns([1, 2, 1])
+
+    with col_left:
+        # Regime indicator
+        regime_class = "regime-high" if regime == "HIGH-ACTIVITY" else "regime-dormant"
+        st.markdown(
+            f"<div style='text-align:center; padding:0.5rem 0;'>"
+            f"<span class='regime-tag {regime_class}'>Regime: {regime}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # VIX indicator
+        vix_color = "#F85149" if vix_level > 30 else "#D29922" if vix_level > 22 else "#3FB950"
+        st.markdown(
+            f"<div class='data-card'>"
+            f"<div class='data-card-value'><span class='mono' style='color:{vix_color}'>{vix_level:.1f}</span></div>"
+            f"<div class='data-card-label'>VIX (4H Trailing)</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        # News sentiment
+        sent_color = "#3FB950" if news_sentiment > 0.2 else "#F85149" if news_sentiment < -0.2 else "#D29922"
+        st.markdown(
+            f"<div class='data-card' style='margin-top:0.5rem;'>"
+            f"<div class='data-card-value'><span class='mono' style='color:{sent_color}'>{news_sentiment:+.2f}</span></div>"
+            f"<div class='data-card-label'>News Sentiment</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        # News volume
+        st.markdown(
+            f"<div class='data-card' style='margin-top:0.5rem;'>"
+            f"<div class='data-card-value'><span class='mono'>{news_volume}</span></div>"
+            f"<div class='data-card-label'>News Volume (4H)</div></div>",
+            unsafe_allow_html=True,
+        )
+
     with col_center:
         # Probability gauge
         if prob >= 0.60:
@@ -563,10 +691,51 @@ with tab1:
             unsafe_allow_html=True,
         )
 
-        signal_class = "signal-hot" if signal == "HOT" else "signal-cold"
+        signal_class_map = {"HOT": "signal-hot", "WARM": "signal-warm", "COLD": "signal-cold"}
+        signal_class = signal_class_map.get(signal, "signal-cold")
         st.markdown(
             f"<p style='text-align:center; margin-top:0.5rem;'>"
             f"<span class='signal-tag {signal_class}'>Signal: {signal}</span></p>",
+            unsafe_allow_html=True,
+        )
+
+    with col_right:
+        # Alpha Delta display
+        alpha_delta = arbitrage.get("alpha_delta", 0.0)
+        poly_baseline = arbitrage.get("polymarket_baseline", 0.5)
+        has_alpha = arbitrage.get("has_alpha", False)
+
+        if alpha_delta >= 0.10:
+            alpha_class = "alpha-positive"
+        elif alpha_delta > 0:
+            alpha_class = "alpha-neutral"
+        else:
+            alpha_class = "alpha-negative"
+
+        st.markdown(
+            f"<div class='alpha-container'>"
+            f"<div class='alpha-value {alpha_class}'>{alpha_delta:+.1%}</div>"
+            f"<div class='alpha-label'>Alpha Delta</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Polymarket baseline
+        st.markdown(
+            f"<div class='data-card'>"
+            f"<div class='data-card-value'><span class='mono'>{poly_baseline:.0%}</span></div>"
+            f"<div class='data-card-label'>Polymarket Baseline</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        # Alpha status
+        alpha_status_color = "#3FB950" if has_alpha else "#484F58"
+        alpha_status_text = "EDGE DETECTED" if has_alpha else "NO EDGE"
+        st.markdown(
+            f"<div style='text-align:center; padding:0.5rem 0; margin-top:0.5rem;'>"
+            f"<span class='mono' style='color:{alpha_status_color}; font-size:0.7rem; "
+            f"font-weight:600; letter-spacing:0.1em;'>{alpha_status_text}</span>"
+            f"</div>",
             unsafe_allow_html=True,
         )
 
@@ -668,7 +837,18 @@ with tab1:
 
     with right_col:
         st.markdown('<div class="section-header">Execution Engine</div>', unsafe_allow_html=True)
+
         if signal == "HOT" and contracts:
+            # Show Alpha Delta banner at top of execution panel
+            st.markdown(
+                f"<div style='background: rgba(63,185,80,0.08); border: 1px solid rgba(63,185,80,0.25); "
+                f"border-radius: 3px; padding: 0.6rem 1rem; margin-bottom: 0.8rem; text-align: center;'>"
+                f"<span class='mono' style='color: #3FB950; font-size: 0.75rem; font-weight: 600; "
+                f"letter-spacing: 0.1em;'>ALPHA DETECTED: {alpha_delta:+.1%} EDGE VS POLYMARKET</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
             st.markdown(
                 f"<p style='font-family: JetBrains Mono, monospace; font-size: 0.7rem; "
                 f"color: #3FB950; letter-spacing: 0.1em; text-transform: uppercase;'>"
@@ -677,9 +857,19 @@ with tab1:
             )
             for c in contracts:
                 sector_tag = f"<span class='order-sector'>{c.get('sector', '')}</span>" if c.get('sector') else ""
+
+                # Alpha tag per contract
+                contract_alpha = c.get("contract_alpha", 0)
+                if contract_alpha >= 0.10:
+                    alpha_tag = f"<span class='order-alpha order-alpha-pos'>ALPHA {contract_alpha:+.0%}</span>"
+                elif contract_alpha > 0:
+                    alpha_tag = f"<span class='order-alpha order-alpha-neg'>+{contract_alpha:.0%}</span>"
+                else:
+                    alpha_tag = f"<span class='order-alpha order-alpha-neg'>{contract_alpha:+.0%}</span>"
+
                 st.markdown(
                     f"<div class='order-ticket'>"
-                    f"<div class='order-contract'>{c['contract']}{sector_tag}</div>"
+                    f"<div class='order-contract'>{c['contract']}{sector_tag}{alpha_tag}</div>"
                     f"<div class='order-prices'>"
                     f"<span class='order-yes'>YES <span class='mono'>{c['yes_price']:.0%}</span></span>"
                     f"<span class='order-no'>NO <span class='mono'>{c['no_price']:.0%}</span></span>"
@@ -703,6 +893,28 @@ with tab1:
                         key=f"no_{contract_id}",
                     ):
                         st.success(f"ORDER FILLED: NO @ {c['no_price']:.0%} on {c['market']}")
+
+        elif signal == "WARM":
+            st.markdown(
+                f"<div style='background: rgba(210,153,34,0.08); border: 1px solid rgba(210,153,34,0.25); "
+                f"border-radius: 3px; padding: 0.8rem 1rem; text-align: center;'>"
+                f"<span class='mono' style='color: #D29922; font-size: 0.75rem; font-weight: 600; "
+                f"letter-spacing: 0.1em;'>SIGNAL WARM &mdash; NO ARBITRAGE EDGE</span><br>"
+                f"<span class='mono' style='color: #484F58; font-size: 0.65rem;'>"
+                f"ML: {prob:.0%} vs Polymarket: {poly_baseline:.0%} &mdash; "
+                f"Alpha: {alpha_delta:+.1%} (need +10%)</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown("")
+            st.markdown(
+                "<div class='standby-box'>"
+                "<div class='standby-label' style='color:#D29922;'>Monitoring</div>"
+                "<div class='standby-detail'>Probability above base threshold but insufficient alpha.</div>"
+                "<div class='standby-detail' style='margin-top:0.3rem;'>Awaiting +10% edge over crowd consensus.</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
         elif signal == "HOT":
             st.warning("Signal active. No contracts matched the current sector filter.")
@@ -1062,13 +1274,13 @@ with tab4:
                 ))
                 fig_fi.update_layout(
                     title=dict(
-                        text="FEATURE IMPORTANCE (GRADIENT BOOSTING)",
+                        text="FEATURE IMPORTANCE (GRADIENT BOOSTING — 16 FEATURES)",
                         font=dict(family="JetBrains Mono", size=13),
                     ),
                     template="plotly_dark",
                     paper_bgcolor="#0E1117",
                     plot_bgcolor="#0E1117",
-                    height=400,
+                    height=500,
                     yaxis=dict(autorange="reversed", gridcolor="#161B22"),
                     xaxis_title="Importance",
                     font=dict(family="JetBrains Mono"),
@@ -1166,8 +1378,8 @@ with tab4:
 # ---------------------------------------------------------------------------
 st.markdown(
     "<div class='terminal-footer'>"
-    "MENTIONBOT v2.0 // YHACK 2025 &mdash; "
-    "GradientBoosting (12 features) trained on 17,922 posts &mdash; "
+    "MENTIONBOT v3.0 // YHACK 2025 &mdash; "
+    "GradientBoosting (16 features) + Alpha Arbitrage + Regime Detection + VIX Feedback &mdash; "
     "6-sector impact analysis"
     "</div>",
     unsafe_allow_html=True,

@@ -1,7 +1,7 @@
 """
-market_agent.py — MentionBot Prediction Market Agent v2
+market_agent.py — MentionBot Prediction Market Agent v3
 ========================================================
-Enhanced with dynamic pricing, sector filtering, and P&L tracking.
+Enhanced with Polymarket arbitrage evaluation and Alpha Delta logic.
 
 Public API:
   - search_market_contracts(topic, sector, probability)  -> list[dict]
@@ -171,8 +171,8 @@ def search_market_contracts(
     adjusted = []
     for c in contracts:
         ac = c.copy()
-        # Higher prediction probability → shift YES prices up slightly
-        prob_shift = (probability - 0.5) * 0.08  # ±4% shift
+        # Higher prediction probability -> shift YES prices up slightly
+        prob_shift = (probability - 0.5) * 0.08  # +/-4% shift
         ac["yes_price"] = round(min(0.95, max(0.05, c["yes_price"] + prob_shift)), 2)
         ac["no_price"] = round(1.0 - ac["yes_price"], 2)
         # Volume increases with higher probability (more interest)
@@ -181,6 +181,64 @@ def search_market_contracts(
         adjusted.append(ac)
 
     return adjusted
+
+
+# ---------------------------------------------------------------------------
+# Arbitrage Evaluation — Polymarket Alpha Delta
+# ---------------------------------------------------------------------------
+
+ALPHA_DELTA_THRESHOLD = 0.10  # Minimum +10% edge to trigger HOT
+
+
+def evaluate_arbitrage(
+    ml_probability: float,
+    contracts: list[dict],
+) -> dict:
+    """
+    Compare ML model's internal probability against the theoretical
+    Polymarket baseline (contract yes_price) to compute Alpha Delta.
+
+    Alpha Delta = ML_probability - Polymarket_baseline
+    A positive delta means our model sees an edge the crowd is missing.
+
+    Returns:
+        {
+            "polymarket_baseline": float,   # avg crowd probability
+            "ml_probability": float,        # our model's probability
+            "alpha_delta": float,           # our edge
+            "has_alpha": bool,              # alpha_delta >= threshold
+            "contracts_with_alpha": list,   # contracts where we have edge
+        }
+    """
+    if not contracts:
+        return {
+            "polymarket_baseline": 0.50,
+            "ml_probability": ml_probability,
+            "alpha_delta": ml_probability - 0.50,
+            "has_alpha": (ml_probability - 0.50) >= ALPHA_DELTA_THRESHOLD,
+            "contracts_with_alpha": [],
+        }
+
+    # Compute average Polymarket baseline from contract prices
+    polymarket_baseline = sum(c["yes_price"] for c in contracts) / len(contracts)
+
+    alpha_delta = ml_probability - polymarket_baseline
+
+    # Tag individual contracts with their specific alpha
+    contracts_with_alpha = []
+    for c in contracts:
+        ca = c.copy()
+        ca["contract_alpha"] = round(ml_probability - c["yes_price"], 4)
+        ca["has_edge"] = ca["contract_alpha"] >= ALPHA_DELTA_THRESHOLD
+        contracts_with_alpha.append(ca)
+
+    return {
+        "polymarket_baseline": round(polymarket_baseline, 4),
+        "ml_probability": round(ml_probability, 4),
+        "alpha_delta": round(alpha_delta, 4),
+        "has_alpha": alpha_delta >= ALPHA_DELTA_THRESHOLD,
+        "contracts_with_alpha": contracts_with_alpha,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -199,36 +257,52 @@ def run_agent_cycle(
     sector_filter: str | None = None,
     posting_velocity_4h: float = 0.5,
     gap_acceleration: float = 0.0,
+    news_volume_4h: float = 10.0,
+    news_sentiment: float = 0.0,
+    simulated_vix_4h_vol: float = 18.0,
 ) -> dict:
     """
     Execute one full agent decision cycle:
       1. Predict P(post in next hour) via the ML model
       2. If above threshold, predict topic via LLM
       3. Search for actionable prediction market contracts
-      4. Get market impact analysis
+      4. Evaluate arbitrage (Alpha Delta) against Polymarket
+      5. Get market impact analysis
+      6. Signal is HOT only if alpha_delta >= +10%
 
-    Returns dict with all results.
+    Returns dict with all results including arbitrage evaluation.
     """
     from ml_engine import predict_live_probability, predict_next_topic
     from market_impact import get_impact_for_topic, simulate_market_reaction
 
-    # Step 1: ML probability
+    # Compute regime from post_count_24h
+    regime_label = "HIGH-ACTIVITY" if post_count_24h > 5 else "DORMANT"
+
+    # Step 1: ML probability (with new features)
     probability = predict_live_probability(
         current_time_hour=current_time_hour,
         hours_since_last=hours_since_last,
         post_count_24h=post_count_24h,
         posting_velocity_4h=posting_velocity_4h,
         gap_acceleration=gap_acceleration,
+        news_volume_4h=news_volume_4h,
+        news_sentiment=news_sentiment,
+        simulated_vix_4h_vol=simulated_vix_4h_vol,
     )
 
-    # Step 2: topic prediction (only if signal is hot)
+    # Step 2: topic prediction (only if base probability is above threshold)
     predicted_topic = None
     contracts = []
     market_impacts = []
+    arbitrage = {
+        "polymarket_baseline": 0.50,
+        "ml_probability": probability,
+        "alpha_delta": probability - 0.50,
+        "has_alpha": False,
+        "contracts_with_alpha": [],
+    }
 
     if probability >= PROBABILITY_THRESHOLD:
-        signal = "HOT"
-
         if use_llm and os.getenv("OPENAI_API_KEY") and recent_tweets:
             predicted_topic = predict_next_topic(recent_tweets)
         elif recent_tweets:
@@ -239,7 +313,18 @@ def run_agent_cycle(
         # Step 3: find contracts
         contracts = search_market_contracts(predicted_topic, sector_filter, probability)
 
-        # Step 4: market impact
+        # Step 4: Arbitrage evaluation — compare our edge vs Polymarket crowd
+        arbitrage = evaluate_arbitrage(probability, contracts)
+
+        # Step 5: Signal is HOT only if we have alpha (>=10% edge over crowd)
+        if arbitrage["has_alpha"]:
+            signal = "HOT"
+            # Use contracts with alpha for execution
+            contracts = arbitrage["contracts_with_alpha"]
+        else:
+            signal = "WARM"  # Above base threshold but no arbitrage edge
+
+        # Step 6: market impact
         market_impacts = simulate_market_reaction(
             predicted_topic, probability, sector_filter,
             seed=int(current_time_hour * 100 + post_count_24h)
@@ -257,6 +342,12 @@ def run_agent_cycle(
         "sim_hour": current_time_hour,
         "hours_since_last": hours_since_last,
         "post_count_24h": post_count_24h,
+        # New quantitative fields
+        "arbitrage": arbitrage,
+        "regime": regime_label,
+        "news_volume_4h": news_volume_4h,
+        "news_sentiment": news_sentiment,
+        "simulated_vix_4h_vol": simulated_vix_4h_vol,
     }
 
 
