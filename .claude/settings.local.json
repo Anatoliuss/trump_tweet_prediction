@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python ml_engine.py)",
+      "Bash(python3 ml_engine.py)",
+      "Bash(where py:*)",
+      "Bash(py --version)"
+    ]
+  }
+}
