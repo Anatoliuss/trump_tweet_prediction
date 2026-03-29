@@ -12,7 +12,10 @@ import plotly.graph_objects as go
 import plotly.express as px
 import numpy as np
 import pandas as pd
-from datetime import datetime
+import pytz
+import random
+import math
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 
@@ -22,6 +25,141 @@ from market_impact import (
     simulate_market_reaction, generate_demo_trade_history, calculate_pnl,
     SECTORS,
 )
+
+EST = pytz.timezone("America/New_York")
+
+# ---------------------------------------------------------------------------
+# Auto-Sync: compute real-time state from truth_archive.csv
+# ---------------------------------------------------------------------------
+DATA_PATHS = [
+    Path(__file__).parent / "data" / "truth_archive.csv",
+    Path(__file__).parent / "data" / "sample_posts.csv",
+]
+
+
+def _compute_live_state() -> dict:
+    """
+    Read the latest post data and compute what all the sidebar sliders
+    should be set to right now, based on the current EST time.
+    """
+    now_est = datetime.now(EST)
+
+    # Load posts
+    df = None
+    for p in DATA_PATHS:
+        if p.exists():
+            df = pd.read_csv(p)
+            # Auto-detect timestamp column
+            for col in ["created_at", "timestamp", "date"]:
+                matches = [c for c in df.columns if c.lower() == col.lower()]
+                if matches:
+                    df["_ts"] = pd.to_datetime(df[matches[0]], utc=True, errors="coerce")
+                    break
+            if "_ts" not in df.columns:
+                continue
+            # Auto-detect text column
+            for col in ["content", "text", "tweet", "body"]:
+                matches = [c for c in df.columns if c.lower() == col.lower()]
+                if matches:
+                    df["_text"] = df[matches[0]].astype(str)
+                    break
+            df = df.dropna(subset=["_ts"])
+            df["_ts_est"] = df["_ts"].dt.tz_convert(EST)
+            df = df.sort_values("_ts_est")
+            break
+
+    if df is None or df.empty:
+        # Fallback defaults if no data available
+        return {
+            "sim_hour": now_est.hour,
+            "hours_since": 2.0,
+            "post_count_24h": 5,
+            "posting_velocity": 0.5,
+            "news_volume": 10,
+            "news_sentiment": 0.0,
+            "vix_level": 18.0,
+        }
+
+    # Current hour
+    current_hour = now_est.hour
+
+    # Hours since last post
+    last_post_time = df["_ts_est"].iloc[-1]
+    hours_since_last = (now_est - last_post_time).total_seconds() / 3600
+    hours_since_last = round(min(24.0, max(0.0, hours_since_last)), 2)
+    # Round to nearest 0.25 for slider step
+    hours_since_last = round(hours_since_last * 4) / 4
+
+    # Rolling 24h post count
+    cutoff_24h = now_est - timedelta(hours=24)
+    posts_24h = int((df["_ts_est"] >= cutoff_24h).sum())
+    posts_24h = min(50, posts_24h)
+
+    # Posting velocity (posts in last 4 hours / 4)
+    cutoff_4h = now_est - timedelta(hours=4)
+    posts_4h = int((df["_ts_est"] >= cutoff_4h).sum())
+    velocity = round(posts_4h / 4.0, 2)
+    velocity = round(velocity * 4) / 4  # snap to 0.25 step
+    velocity = min(5.0, velocity)
+
+    # Simulated news/VIX based on current activity level and time
+    # More active = more newsworthy = higher volume
+    rng = random.Random(now_est.hour * 100 + now_est.minute)
+    is_business_hours = 9 <= current_hour <= 17
+
+    news_vol = rng.randint(5, 12)
+    if is_business_hours:
+        news_vol += rng.randint(3, 8)
+    if posts_24h > 10:
+        news_vol += rng.randint(5, 10)  # high activity = high news
+    news_vol = min(50, news_vol)
+
+    # Sentiment: slightly negative when posting is heavy
+    sentiment = round(rng.gauss(0.05, 0.2), 2)
+    if posts_24h > 15:
+        sentiment -= 0.2
+    sentiment = round(max(-1.0, min(1.0, sentiment)) * 20) / 20  # snap to 0.05 step
+
+    # VIX: baseline 18, elevated if high activity
+    vix = round(rng.gauss(18.0, 2.0), 1)
+    if posts_24h > 10:
+        vix += (posts_24h - 10) * 0.5
+    if hours_since_last < 0.5:
+        vix += 2.0  # very recent post = possible market event
+    vix = round(max(10.0, min(50.0, vix)) * 2) / 2  # snap to 0.5 step
+
+    # Recent tweets for the feed
+    recent_texts = []
+    if "_text" in df.columns:
+        # Filter out RTs and get last 5
+        real_posts = df[~df["_text"].str.startswith("RT @", na=False)]
+        recent_texts = real_posts["_text"].tail(5).tolist()
+
+    return {
+        "sim_hour": current_hour,
+        "hours_since": hours_since_last,
+        "post_count_24h": posts_24h,
+        "posting_velocity": velocity,
+        "news_volume": news_vol,
+        "news_sentiment": sentiment,
+        "vix_level": vix,
+        "recent_tweets": recent_texts,
+    }
+
+
+def _on_auto_sync():
+    """Callback: compute live state and write it into session_state keys."""
+    state = _compute_live_state()
+    st.session_state["k_sim_hour"] = state["sim_hour"]
+    st.session_state["k_hours_since"] = state["hours_since"]
+    st.session_state["k_post_count_24h"] = state["post_count_24h"]
+    st.session_state["k_posting_velocity"] = state["posting_velocity"]
+    st.session_state["k_news_volume"] = state["news_volume"]
+    st.session_state["k_news_sentiment"] = state["news_sentiment"]
+    st.session_state["k_vix_level"] = state["vix_level"]
+    if state.get("recent_tweets"):
+        st.session_state["k_tweets_text"] = "\n".join(state["recent_tweets"])
+    st.session_state["auto_synced"] = True
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -525,35 +663,64 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Sidebar — Parameter Controls
+# Sidebar — Auto-Sync Button
+# ---------------------------------------------------------------------------
+st.sidebar.markdown(
+    '<div class="sidebar-section">Automation</div>',
+    unsafe_allow_html=True,
+)
+st.sidebar.button(
+    "SYNC TO LIVE",
+    on_click=_on_auto_sync,
+    type="primary",
+    use_container_width=True,
+    help="Auto-set all parameters to current real-time values from the dataset",
+)
+if st.session_state.get("auto_synced"):
+    now_label = datetime.now(EST).strftime("%H:%M:%S EST")
+    st.sidebar.markdown(
+        f"<span class='mono' style='color:#3FB950; font-size:0.65rem;'>"
+        f"SYNCED @ {now_label}</span>",
+        unsafe_allow_html=True,
+    )
+
+# ---------------------------------------------------------------------------
+# Sidebar — Parameter Controls (keyed for auto-sync)
 # ---------------------------------------------------------------------------
 st.sidebar.markdown('<div class="sidebar-section">System Parameters</div>', unsafe_allow_html=True)
 
 sim_hour = st.sidebar.slider(
     "HOUR (EST)", min_value=0, max_value=23, value=10,
+    key="k_sim_hour",
     help="Simulated hour of day in Eastern Time"
 )
 hours_since = st.sidebar.slider(
     "GAP (HRS SINCE LAST)", min_value=0.0, max_value=24.0, value=1.5, step=0.25,
+    key="k_hours_since",
 )
 post_count_24h = st.sidebar.slider(
     "ROLLING COUNT (24H)", min_value=0, max_value=50, value=8,
+    key="k_post_count_24h",
 )
 posting_velocity = st.sidebar.slider(
     "VELOCITY (POSTS/HR, 4H AVG)", min_value=0.0, max_value=5.0, value=0.5, step=0.25,
+    key="k_posting_velocity",
 )
 
 st.sidebar.markdown('<div class="sidebar-section">Market Context</div>', unsafe_allow_html=True)
 news_volume = st.sidebar.slider(
     "NEWS VOLUME (4H)", min_value=0, max_value=50, value=10,
+    key="k_news_volume",
     help="Breaking news article count in last 4 hours"
 )
 news_sentiment = st.sidebar.slider(
     "NEWS SENTIMENT", min_value=-1.0, max_value=1.0, value=0.0, step=0.05,
+    key="k_news_sentiment",
     help="Aggregate news sentiment (-1=bearish, +1=bullish)"
 )
 vix_level = st.sidebar.slider(
     "VIX (4H TRAILING)", min_value=10.0, max_value=50.0, value=18.0, step=0.5,
+    key="k_vix_level",
     help="Simulated CBOE Volatility Index"
 )
 
@@ -573,6 +740,7 @@ tweets_text = st.sidebar.text_area(
     "RECENT POSTS (1 PER LINE)",
     value=default_tweets,
     height=160,
+    key="k_tweets_text",
 )
 recent_tweets = [t.strip() for t in tweets_text.strip().split("\n") if t.strip()]
 
